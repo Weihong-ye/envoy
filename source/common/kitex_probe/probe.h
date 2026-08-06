@@ -65,6 +65,15 @@ void bindTrace(uint64_t conn_id, int32_t seq_id, absl::string_view traceparent,
 void rpcEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono);
 
 /**
+ * 该连接上当前是否有被采样的 RPC。
+ *
+ * 只供**非热路径**做一次性门控。通用读路径（ConnectionImpl 的 epoll/readv 点位）
+ * 服务全进程所有连接，不能每个事件都查一次 binding；所以在 onPoolReady 里查一次，
+ * 把结果作为裸标志挂到上游连接上，热路径只判零。
+ */
+bool isSampled(uint64_t conn_id);
+
+/**
  * RPC 结束，释放该连接上的绑定状态。
  */
 void endRpc(uint64_t conn_id);
@@ -104,6 +113,8 @@ Stats stats();
 
 #define KITEX_PROBE_END(conn_id) ::Envoy::KitexProbe::endRpc((conn_id))
 
+#define KITEX_PROBE_SAMPLED(conn_id) ::Envoy::KitexProbe::isSampled((conn_id))
+
 #else
 
 #define KITEX_PROBE_CONN(conn_id, point, time_source)                                              \
@@ -118,5 +129,6 @@ Stats stats();
 #define KITEX_PROBE_END(conn_id)                                                                   \
   do {                                                                                             \
   } while (0)
+#define KITEX_PROBE_SAMPLED(conn_id) false
 
 #endif

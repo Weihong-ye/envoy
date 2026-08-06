@@ -301,6 +301,15 @@ void rpcEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono) {
   push(st, Event{b.trace, point, m, b.base_wall + (m - b.base_mono), b.seq_id});
 }
 
+bool isSampled(uint64_t conn_id) {
+  if (!config().enabled) {
+    return false;
+  }
+  auto& st = tls();
+  auto it = st.bindings.find(conn_id);
+  return it != st.bindings.end() && it->second.sampled;
+}
+
 void endRpc(uint64_t conn_id) {
   if (!config().enabled) {
     return;

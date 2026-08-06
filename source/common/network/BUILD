@@ -118,6 +118,7 @@ envoy_cc_library(
         "//source/common/common:enum_to_int",
         "//source/common/common:minimal_logger_lib",
         "//source/common/event:libevent_lib",
+        "//source/common/kitex_probe:kitex_probe_lib",
         "//source/common/network:socket_option_factory_lib",
         "//source/common/runtime:runtime_features_lib",
         "//source/common/stream_info:stream_info_lib",

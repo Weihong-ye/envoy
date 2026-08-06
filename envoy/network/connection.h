@@ -214,6 +214,24 @@ public:
   virtual uint64_t id() const PURE;
 
   /**
+   * 打点专用（wip/kitex-e2e-probe 分支，永不上游）。
+   *
+   * 把本连接关联到某条被采样 RPC 的**下游** conn_id；0 表示未采样。
+   *
+   * 为什么必须放在通用接口上：上游连接的 epoll/readv 事件在 ConnectionImpl 里触发，
+   * 那里能拿到的 id() 是上游连接 id，而 trace binding 建在下游 conn_id 上，两者对不上，
+   * 直接打点会查不到 binding 被静默丢弃（conn_manager.cc 里记过这个坑）。
+   *
+   * 为什么不用旁路 map：通用读路径服务全进程所有连接，压测下每个 epoll 事件做一次
+   * hash 查找的代价不可接受。用裸成员后，未采样路径退化成一次读加一次分支，
+   * 且绝大多数取值为 0，分支预测几乎必中。
+   *
+   * 带默认实现，因此各类 mock/fake/装饰器连接无需改动。
+   */
+  virtual void setKitexProbeDownstreamId(uint64_t) {}
+  virtual uint64_t kitexProbeDownstreamId() const { return 0; }
+
+  /**
    * @param vector of bytes to which the connection should append hash key data. Any data already in
    * the key vector must not be modified.
    */

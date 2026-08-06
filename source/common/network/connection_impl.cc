@@ -23,6 +23,7 @@
 #include "source/common/network/socket_option_factory.h"
 #include "source/common/network/socket_option_impl.h"
 #include "source/common/network/utility.h"
+#include "source/common/kitex_probe/probe.h"
 #include "source/common/runtime/runtime_features.h"
 
 namespace Envoy {
@@ -717,6 +718,16 @@ void ConnectionImpl::setFailureReason(absl::string_view failure_reason) {
 }
 
 void ConnectionImpl::onFileEvent(uint32_t events) {
+  // epoll 唤醒后用户态第一个可记录的时刻。放在函数最前面（先于 ScopeTracker），
+  // 因为这个点的全部意义就是「尽可能早」——它是把「真正在等对端」和
+  // 「已经醒了但还没读到」切开的那一刀。
+  //
+  // 只对读就绪打点：写就绪走 onWriteReady 另一条路径，混进来会污染分解。
+  // 未采样时 kitex_probe_dn_id_ 为 0，整个判断就是一次成员读加一次分支。
+  if (kitex_probe_dn_id_ != 0 && (events & Event::FileReadyType::Read)) {
+    KITEX_PROBE(kitex_probe_dn_id_, "up_epoll_wake", dispatcher_.timeSource());
+  }
+
   ScopeTrackerScopeState scope(this, this->dispatcher_);
   ENVOY_CONN_LOG(trace, "socket event: {}", *this, events);
 
@@ -797,7 +808,21 @@ void ConnectionImpl::onReadReady() {
   // reading from the transport if the read buffer is above high watermark at the start of the
   // method.
   transport_wants_read_ = false;
+
+  // 括住 socket 收包。注意 doRead 内部是个循环（RawBufferSocket::doRead），
+  // 会反复 readv 直到 EAGAIN 或缓冲区该排空，所以这一段是
+  // 「N 次 readv + N 次 buffer append」的总和，不是单次系统调用。
+  // 对 thrift 小报文 N 通常为 2（一次拿到数据，一次拿到 EAGAIN）。
+  // 若实测这段异常大，再往 RawBufferSocket 循环内部钻。
+  const bool probe = kitex_probe_dn_id_ != 0;
+  if (probe) {
+    KITEX_PROBE(kitex_probe_dn_id_, "up_readv_start", dispatcher_.timeSource());
+  }
   IoResult result = transport_socket_->doRead(*read_buffer_);
+  if (probe) {
+    KITEX_PROBE(kitex_probe_dn_id_, "up_readv_done", dispatcher_.timeSource());
+  }
+
   uint64_t new_buffer_size = read_buffer_->length();
   updateReadBufferStats(result.bytes_processed_, new_buffer_size);
 
