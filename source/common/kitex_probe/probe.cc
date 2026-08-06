@@ -121,11 +121,20 @@ Config& config() {
     if (path != nullptr && *path != '\0') {
       init.path = path;
       init.node = (node != nullptr && *node != '\0') ? node : "envoy";
-      // host 必须是真实主机名而非节点名：merge 工具靠它判断两个事件
-      // 是否同机，进而决定能否相减（设计文档 §8.2）。
-      // 早先把 host 也填成 node，导致单机跑出来被误判成「3 台主机」。
-      char hostname[256] = {0};
-      init.host = (::gethostname(hostname, sizeof(hostname) - 1) == 0) ? hostname : "unknown";
+      // host 标识决定 merge 工具是否允许把两个事件的时间戳相减（§8.2），
+      // 因此必须能真正区分机器。
+      //
+      // **不能只靠 gethostname**：本实验的两台机器 hostname 都是
+      // localhost.localdomain，靠它判断会把跨机误判成同机，
+      // 于是跨机相减这一最危险的操作反而畅通无阻。
+      // 所以优先取显式配置的 KITEX_PROBE_HOST。
+      const char* host = std::getenv("KITEX_PROBE_HOST");
+      if (host != nullptr && *host != '\0') {
+        init.host = host;
+      } else {
+        char hostname[256] = {0};
+        init.host = (::gethostname(hostname, sizeof(hostname) - 1) == 0) ? hostname : "unknown";
+      }
       init.enabled = true;
     }
     return init;
