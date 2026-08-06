@@ -6,7 +6,9 @@
 #include "envoy/http/header_formatter.h"
 
 #include "source/common/buffer/buffer_impl.h"
+#include "source/common/common/macros.h"
 
+#include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_replace.h"
@@ -73,9 +75,11 @@ TTHeaderIntKeyNameValues::TTHeaderIntKeyNameValues() {
   };
 }
 
-bool TTHeaderIntKeyNameValues::toId(const Http::LowerCaseString& name, uint16_t& out) const {
+bool TTHeaderIntKeyNameValues::toId(absl::string_view name, uint16_t& out) const {
+  // 26 项线性扫描。之所以不上 hash map：项数极少且都是短串，线性比较在
+  // 缓存友好度上通常还更快，而且省掉一个静态容器的初始化。
   for (uint16_t i = 0; i < by_id_.size(); i++) {
-    if (*by_id_[i] == name) {
+    if (by_id_[i]->get() == name) {
       out = i;
       return true;
     }
@@ -313,15 +317,14 @@ void TTHeaderTransportImpl::encodeFrame(Buffer::Instance& buffer, const MessageM
   bool has_acl_token = false;
 
   const auto& int_names = TTHeaderIntKeyNames::get();
-  const Http::LowerCaseString acl_key(aclTokenKey());
 
   auto classify = [&](const Http::HeaderEntry& header) -> Http::HeaderMap::Iterate {
+    // header map 里的 key 已是小写，直接按 string_view 比较，不构造 LowerCaseString。
     const absl::string_view raw_key = header.key().getStringView();
     const absl::string_view value = header.value().getStringView();
-    const Http::LowerCaseString lc_key{std::string(raw_key)};
 
     uint16_t id = 0;
-    if (int_names.toId(lc_key, id)) {
+    if (int_names.toId(raw_key, id)) {
       int_kvs.emplace_back(id, std::string(value));
       return Http::HeaderMap::Iterate::Continue;
     }
@@ -333,13 +336,15 @@ void TTHeaderTransportImpl::encodeFrame(Buffer::Instance& buffer, const MessageM
         return Http::HeaderMap::Iterate::Continue;
       }
     }
-    if (lc_key == acl_key) {
+    // ACL token 的 header 名是大写前缀的 metainfo key，而 map 里存的是小写形式，
+    // 所以这里比较的也是小写化后的常量。
+    if (absl::EqualsIgnoreCase(raw_key, aclTokenKey())) {
       acl_token = std::string(value);
       has_acl_token = true;
       return Http::HeaderMap::Iterate::Continue;
     }
-    // 普通 StrKV：用 formatter 还原原始大小写（§metainfo 大写前缀）。
-    str_kvs.emplace_back(formatter ? std::string(formatter->format(raw_key)) : std::string(raw_key),
+    // 普通 StrKV：用 formatter 还原原始大小写（metainfo 前缀是大写的）。
+    str_kvs.emplace_back(formatter ? formatter->format(raw_key) : std::string(raw_key),
                          std::string(value));
     return Http::HeaderMap::Iterate::Continue;
   };

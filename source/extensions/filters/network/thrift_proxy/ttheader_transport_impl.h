@@ -119,8 +119,9 @@ public:
   }
 
   // 反向：header 名 → IntKV 数字 key。编码时用于把 header 还原回 IntKV 段。
-  // 未命中返回 false。
-  bool toId(const Http::LowerCaseString& name, uint16_t& out) const;
+  // 取 string_view 而非 LowerCaseString：header map 里存的 key 本就是小写，
+  // 构造 LowerCaseString 只会白白多一次堆分配。未命中返回 false。
+  bool toId(absl::string_view name, uint16_t& out) const;
 
   const Http::LowerCaseString MeshVersion{"x-tt-mesh-version"};
   const Http::LowerCaseString TransportType{"x-tt-transport-type"};
