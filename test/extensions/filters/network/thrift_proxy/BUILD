@@ -145,6 +145,18 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
+    name = "ttheader_transport_impl_test",
+    srcs = ["ttheader_transport_impl_test.cc"],
+    extension_names = ["envoy.filters.network.thrift_proxy"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/extensions/filters/network/thrift_proxy:ttheader_transport_lib",
+        "//test/test_common:printers_lib",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_extension_cc_test(
     name = "unframed_transport_impl_test",
     srcs = ["unframed_transport_impl_test.cc"],
     extension_names = ["envoy.filters.network.thrift_proxy"],

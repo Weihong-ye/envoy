@@ -48,6 +48,7 @@ envoy_cc_extension(
         ":header_transport_lib",
         ":protocol_interface",
         ":protocol_options_config_lib",
+        ":ttheader_transport_lib",
         ":twitter_protocol_lib",
         ":unframed_transport_lib",
         "//envoy/access_log:access_log_interface",
@@ -347,6 +348,7 @@ envoy_cc_library(
         ":framed_transport_lib",
         ":header_transport_lib",
         ":transport_interface",
+        ":ttheader_transport_lib",
         ":twitter_protocol_lib",
         ":unframed_transport_lib",
         "//source/common/common:assert_lib",
@@ -383,6 +385,23 @@ envoy_cc_library(
         ":buffer_helper_lib",
         ":transport_interface",
         "//source/common/common:assert_lib",
+    ],
+    alwayslink = 1,
+)
+
+envoy_cc_library(
+    name = "ttheader_transport_lib",
+    srcs = [
+        "ttheader_transport_impl.cc",
+    ],
+    hdrs = [
+        "ttheader_transport_impl.h",
+    ],
+    deps = [
+        ":buffer_helper_lib",
+        ":transport_interface",
+        "//source/common/common:assert_lib",
+        "//source/common/singleton:const_singleton",
     ],
     alwayslink = 1,
 )

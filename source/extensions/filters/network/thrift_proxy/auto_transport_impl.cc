@@ -8,6 +8,7 @@
 #include "source/extensions/filters/network/thrift_proxy/compact_protocol_impl.h"
 #include "source/extensions/filters/network/thrift_proxy/framed_transport_impl.h"
 #include "source/extensions/filters/network/thrift_proxy/header_transport_impl.h"
+#include "source/extensions/filters/network/thrift_proxy/ttheader_transport_impl.h"
 #include "source/extensions/filters/network/thrift_proxy/unframed_transport_impl.h"
 
 namespace Envoy {
@@ -30,10 +31,14 @@ bool AutoTransportImpl::decodeFrameStart(Buffer::Instance& buffer, MessageMetada
     // 2. If unframed transport, size will appear negative due to leading protocol bytes.
     // 3. If header transport, size is followed by 0x0FFF which is distinct from leading
     //    protocol bytes.
-    // 4. For framed transport, size is followed by protocol bytes.
+    // 4. If Kitex TTHeader transport, size is followed by 0x1000, likewise distinct.
+    // 5. For framed transport, size is followed by protocol bytes.
     if (size > 0 && size <= HeaderTransportImpl::MaxFrameSize &&
         HeaderTransportImpl::isMagic(proto_start)) {
       setTransport(std::make_unique<HeaderTransportImpl>());
+    } else if (size > 0 && size <= TTHeaderTransportImpl::MaxFrameSize &&
+               TTHeaderTransportImpl::isMagic(proto_start)) {
+      setTransport(std::make_unique<TTHeaderTransportImpl>());
     } else if (size > 0 && size <= FramedTransportImpl::MaxFrameSize) {
       // TODO(zuercher): Spec says max size is 16,384,000 (0xFA0000). Apache C++ TFramedTransport
       // is configurable, but defaults to 256 MB (0x1000000).

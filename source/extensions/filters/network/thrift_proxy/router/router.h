@@ -577,10 +577,16 @@ protected:
               std::nullopt};
     }
 
-    const auto passthrough_supported =
-        (transport == TransportType::Framed || transport == TransportType::Header) &&
-        (final_transport == TransportType::Framed || final_transport == TransportType::Header) &&
-        protocol == final_protocol && final_protocol != ProtocolType::Twitter;
+    // TTHeader 与 Framed/Header 一样是长度前缀分帧、消息体对传输层不透明，
+    // 因此同样支持 payload passthrough（消息体逐字节透传，不经协议层解析）。
+    const auto supports_passthrough = [](TransportType t) {
+      return t == TransportType::Framed || t == TransportType::Header ||
+             t == TransportType::TTHeader;
+    };
+    const auto passthrough_supported = supports_passthrough(transport) &&
+                                       supports_passthrough(final_transport) &&
+                                       protocol == final_protocol &&
+                                       final_protocol != ProtocolType::Twitter;
     UpstreamRequestInfo result = {passthrough_supported, final_transport, final_protocol,
                                   conn_pool_data};
     return {std::nullopt, result};

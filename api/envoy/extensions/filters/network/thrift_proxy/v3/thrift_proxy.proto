@@ -40,6 +40,17 @@ enum TransportType {
 
   // The Thrift proxy will assume the client is using the Thrift header transport.
   HEADER = 3;
+
+  // The Thrift proxy will assume the client is using the CloudWeGo Kitex TTHeader transport.
+  //
+  // .. note::
+  //
+  //   TTHeader resembles the Apache Thrift header transport but is **not** wire compatible with
+  //   it: the magic differs (0x1000 vs 0x0FFF) and every variable-length integer in the header
+  //   is a fixed-width integer in TTHeader. Only ``BINARY`` and ``COMPACT`` payload protocols are
+  //   supported; other TTHeader protocol ids (notably KitexProtobuf and the TTHeader streaming
+  //   variants) are rejected rather than silently misparsed.
+  TTHEADER = 4;
 }
 
 // Thrift Protocol types supported by Envoy.

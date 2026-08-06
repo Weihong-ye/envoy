@@ -16,6 +16,7 @@ enum class TransportType {
   Framed,
   Header,
   Unframed,
+  TTHeader,
   Auto,
 
   // ATTENTION: MAKE SURE THIS REMAINS EQUAL TO THE LAST TRANSPORT TYPE
@@ -36,6 +37,9 @@ public:
   // Unframed transport
   const std::string UNFRAMED = "unframed";
 
+  // CloudWeGo Kitex TTHeader transport
+  const std::string TTHEADER = "ttheader";
+
   // Auto-detection transport
   const std::string AUTO = "auto";
 
@@ -47,6 +51,8 @@ public:
       return HEADER;
     case TransportType::Unframed:
       return UNFRAMED;
+    case TransportType::TTHeader:
+      return TTHEADER;
     case TransportType::Auto:
       return AUTO;
     }
@@ -120,6 +126,8 @@ public:
       return TransportType::Unframed;
     case envoy::extensions::filters::network::thrift_proxy::v3::HEADER:
       return TransportType::Header;
+    case envoy::extensions::filters::network::thrift_proxy::v3::TTHEADER:
+      return TransportType::TTHeader;
     }
     PANIC_DUE_TO_CORRUPT_ENUM;
   }
