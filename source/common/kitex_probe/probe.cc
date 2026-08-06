@@ -1,6 +1,7 @@
 #include "source/common/kitex_probe/probe.h"
 
 #include <atomic>
+#include <memory>
 #include <cstdio>
 #include <cstdlib>
 #include <unistd.h>
@@ -56,9 +57,15 @@ Parsed parseTraceparent(absl::string_view tp) {
   return p;
 }
 
+// Event 不再自带 trace 字符串。
+//
+// trace-id 是 32 字符，超过 SSO 阈值必然堆分配；而它在一次 RPC 内不变，
+// 每个点都拷一份等于每请求多做 8 次 malloc。改成共享同一份：
+// binding 持有 shared_ptr<const std::string>，事件只拷指针。
+// point 是短名字（SSO 内，无分配），且都是字面量，直接存 string_view。
 struct Event {
-  std::string trace;
-  std::string point;
+  std::shared_ptr<const std::string> trace;
+  absl::string_view point; // 指向静态字面量，生命周期长于事件
   int64_t mono_ns;
   int64_t wall_ns;
   int32_t seq_id;
@@ -66,9 +73,12 @@ struct Event {
 
 // 某条连接上「已解析出 trace、正在处理」的 RPC 状态。
 struct Binding {
-  std::string trace;
+  std::shared_ptr<const std::string> trace;
   int32_t seq_id{0};
   bool sampled{false};
+  // wall/mono 的对应基准点，用于由 mono 推算 wall，省去每点一次 CLOCK_REALTIME
+  int64_t base_mono{0};
+  int64_t base_wall{0};
 };
 
 // 每 worker 线程一份。Envoy 的 worker 是单线程事件循环，
@@ -185,7 +195,7 @@ void writeOut(ThreadState& st, std::vector<Event>& events) {
                   R"({"host":"%s","node":"%s","trace":"%s","point":"%s","wall_ns":%d,"mono_ns":%d,)"
                   R"("attrs":{"seq_id":"%d"}})"
                   "\n",
-                  cfg.host, cfg.node, e.trace, e.point, e.wall_ns, e.mono_ns, e.seq_id);
+                  cfg.host, cfg.node, *e.trace, e.point, e.wall_ns, e.mono_ns, e.seq_id);
   }
   g_written.fetch_add(events.size(), std::memory_order_relaxed);
   events.clear();
@@ -235,7 +245,7 @@ void connEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono, Sy
   if (vec.size() > 8) {
     vec.erase(vec.begin());
   }
-  vec.push_back(Event{"", std::string(point), monoNs(mono), wallNs(wall), 0});
+  vec.push_back(Event{nullptr, point, monoNs(mono), wallNs(wall), 0});
 }
 
 void bindTrace(uint64_t conn_id, int32_t seq_id, absl::string_view traceparent, MonotonicTime mono,
@@ -248,8 +258,11 @@ void bindTrace(uint64_t conn_id, int32_t seq_id, absl::string_view traceparent, 
 
   Binding b;
   b.seq_id = seq_id;
+  b.base_mono = monoNs(mono);
+  b.base_wall = wallNs(wall);
   if (p.valid) {
-    b.trace = std::string(p.trace_id);
+    // 整条 RPC 只在这里构造一次 trace 字符串
+    b.trace = std::make_shared<const std::string>(p.trace_id);
     b.sampled = p.sampled;
   }
   st.bindings[conn_id] = b;
@@ -267,12 +280,12 @@ void bindTrace(uint64_t conn_id, int32_t seq_id, absl::string_view traceparent, 
       push(st, std::move(e));
     }
     // bindTrace 自身也是一个点（E2：header 解析完成）
-    push(st, Event{b.trace, "hdr_decoded", monoNs(mono), wallNs(wall), seq_id});
+    push(st, Event{b.trace, absl::string_view("hdr_decoded"), monoNs(mono), wallNs(wall), seq_id});
   }
   it->second.clear();
 }
 
-void rpcEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono, SystemTime wall) {
+void rpcEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono) {
   if (!config().enabled) {
     return;
   }
@@ -282,8 +295,10 @@ void rpcEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono, Sys
   if (it == st.bindings.end() || !it->second.sampled) {
     return;
   }
-  push(st, Event{it->second.trace, std::string(point), monoNs(mono), wallNs(wall),
-                 it->second.seq_id});
+  const auto& b = it->second;
+  const int64_t m = monoNs(mono);
+  // wall 由基准点推算，不再读 CLOCK_REALTIME
+  push(st, Event{b.trace, point, m, b.base_wall + (m - b.base_mono), b.seq_id});
 }
 
 void endRpc(uint64_t conn_id) {
@@ -293,18 +308,32 @@ void endRpc(uint64_t conn_id) {
   auto& st = tls();
   st.bindings.erase(conn_id);
   st.pending.erase(conn_id);
-  // 每次 RPC 结束落盘一次。不这么做的话，流量停止后最后一批事件
-  // 会永远留在内存里 —— 时间触发的刷盘只在「下一次 push」时才检查。
+  // 这里**不**落盘。
+  //
+  // 曾经每次 RPC 结束都 writeOut + fflush，那是为了解决「流量停止后
+  // 最后一批事件永远留在内存」的问题 —— 但代价是每个采样请求一次
+  // write 系统调用。收尾问题应该由进程退出时的 flush 解决，
+  // 而不是让稳态路径为它买单（见 registerExitFlush）。
+}
+
+void flush() {
+  auto& st = tls();
   writeOut(st, st.ready);
   if (st.fp != nullptr) {
     std::fflush(st.fp);
   }
 }
 
-void flush() {
-  auto& st = tls();
-  writeOut(st, st.ready);
-}
+namespace {
+// 线程退出时把该线程剩余的事件落盘。
+//
+// 这才是「收尾」的正确位置：稳态路径完全不必为此付出代价，
+// 而进程/线程结束时只做一次。
+struct ThreadFlusher {
+  ~ThreadFlusher() { flush(); }
+};
+thread_local ThreadFlusher g_thread_flusher;
+} // namespace
 
 Stats stats() {
   return Stats{g_recorded.load(std::memory_order_relaxed),

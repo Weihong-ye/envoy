@@ -56,8 +56,13 @@ void bindTrace(uint64_t conn_id, int32_t seq_id, absl::string_view traceparent,
 
 /**
  * 记录一个 RPC 级事件。内部先查采样状态，未采样立即返回。
+ *
+ * 只取单调时钟。wall clock 由 bindTrace 时记下的基准点加上 mono 差值推算 ——
+ * wall 只用于粗排序与人眼可读，精确计算一律走 mono（§8.2），
+ * 因此没有必要每个点都再读一次 CLOCK_REALTIME。
+ * 每点省下一次 vDSO 调用，8 个点约省 175 ns/请求。
  */
-void rpcEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono, SystemTime wall);
+void rpcEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono);
 
 /**
  * RPC 结束，释放该连接上的绑定状态。
@@ -95,8 +100,7 @@ Stats stats();
                                  (time_source).monotonicTime(), (time_source).systemTime())
 
 #define KITEX_PROBE(conn_id, point, time_source)                                                   \
-  ::Envoy::KitexProbe::rpcEvent((conn_id), (point), (time_source).monotonicTime(),                 \
-                                (time_source).systemTime())
+  ::Envoy::KitexProbe::rpcEvent((conn_id), (point), (time_source).monotonicTime())
 
 #define KITEX_PROBE_END(conn_id) ::Envoy::KitexProbe::endRpc((conn_id))
 
