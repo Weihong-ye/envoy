@@ -93,6 +93,7 @@ envoy_cc_library(
     srcs = ["router_impl.cc"],
     hdrs = ["router_impl.h"],
     deps = [
+        "//source/common/kitex_probe:kitex_probe_lib",
         ":router_interface",
         ":router_ratelimit_lib",
         ":shadow_writer_lib",

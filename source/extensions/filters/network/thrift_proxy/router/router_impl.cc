@@ -1,5 +1,7 @@
 #include "source/extensions/filters/network/thrift_proxy/router/router_impl.h"
 
+#include "source/common/kitex_probe/probe.h"
+
 #include <memory>
 
 #include "envoy/extensions/filters/network/thrift_proxy/v3/route.pb.h"
@@ -291,6 +293,11 @@ FilterStatus Router::messageBegin(MessageMetadataSharedPtr metadata) {
   }
 
   route_entry_ = route_->routeEntry();
+  // E4 路由匹配完成，cluster 已选定
+  if (callbacks_->connection() != nullptr) {
+    KITEX_PROBE(callbacks_->connection()->id(), "route_resolved",
+                callbacks_->streamInfo().timeSource());
+  }
   const std::string& cluster_name = route_entry_->clusterName();
 
   auto prepare_result =
@@ -339,6 +346,11 @@ FilterStatus Router::messageBegin(MessageMetadataSharedPtr metadata) {
 FilterStatus Router::messageEnd() {
   ProtocolConverter::messageEnd();
   const auto encode_size = upstream_request_->encodeAndWrite(upstream_request_buffer_);
+  // E6 请求已编码并写往上游
+  if (callbacks_->connection() != nullptr) {
+    KITEX_PROBE(callbacks_->connection()->id(), "up_write_done",
+                callbacks_->streamInfo().timeSource());
+  }
   addSize(encode_size);
   stats().recordUpstreamRequestSize(*cluster_, request_size_);
   callbacks_->streamInfo().addBytesReceived(request_size_);
@@ -500,6 +512,11 @@ FilterStatus Router::setEnd() {
 }
 
 void Router::onUpstreamData(Buffer::Instance& data, bool end_stream) {
+  // E7 上游响应首字节到达
+  if (callbacks_->connection() != nullptr) {
+    KITEX_PROBE(callbacks_->connection()->id(), "up_first_byte",
+                callbacks_->streamInfo().timeSource());
+  }
   const bool done =
       upstream_request_->handleUpstreamData(data, end_stream, *upstream_response_callbacks_);
   if (done) {

@@ -70,6 +70,7 @@ envoy_cc_library(
     srcs = ["conn_manager.cc"],
     hdrs = ["conn_manager.h"],
     deps = [
+        "//source/common/kitex_probe:kitex_probe_lib",
         ":app_exception_lib",
         ":decoder_lib",
         ":filter_utils_lib",

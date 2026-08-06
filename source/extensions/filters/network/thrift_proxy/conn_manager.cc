@@ -1,5 +1,8 @@
 #include "source/extensions/filters/network/thrift_proxy/conn_manager.h"
 
+#include "source/common/common/macros.h"
+#include "source/common/kitex_probe/probe.h"
+
 #include "envoy/common/exception.h"
 #include "envoy/event/dispatcher.h"
 
@@ -25,6 +28,9 @@ ConnectionManager::ConnectionManager(const ConfigSharedPtr& config,
 ConnectionManager::~ConnectionManager() = default;
 
 Network::FilterStatus ConnectionManager::onData(Buffer::Instance& data, bool end_stream) {
+  // E1 下游首字节到达。此刻 TTHeader 尚未解析，trace 未知，
+  // 故先按连接暂存，待 hdr_decoded 时回填（探针 §8.4.2）。
+  KITEX_PROBE_CONN(read_callbacks_->connection().id(), "dn_first_byte", time_source_);
   request_buffer_.move(data);
   dispatch();
 
@@ -265,6 +271,9 @@ FilterStatus ConnectionManager::ResponseDecoder::transportEnd() {
 }
 
 void ConnectionManager::ResponseDecoder::finalizeResponse() {
+  // E8 上游响应解码完成
+  KITEX_PROBE(parent_.parent_.read_callbacks_->connection().id(), "resp_decoded",
+              parent_.parent_.time_source_);
   pending_transport_end_ = false;
   ConnectionManager& cm = parent_.parent_;
 
@@ -716,7 +725,29 @@ void ConnectionManager::ActiveRpc::prepareFilterAction(DecoderEvent event, Filte
   }
 }
 
+namespace {
+// trace 上下文经 Kitex 的 metainfo persistent 通道传来，
+// 在 TTHeader StrKV 里的键是 RPC_PERSIST_traceparent，
+// Envoy 的 header map 会小写化（原始大小写由 header_keys_preserve_case 保留）。
+const Http::LowerCaseString& traceparentHeader() {
+  CONSTRUCT_ON_FIRST_USE(Http::LowerCaseString, "rpc_persist_traceparent");
+}
+
+absl::string_view traceparentOf(const MessageMetadata& metadata) {
+  if (!metadata.isRequest()) {
+    return {};
+  }
+  const auto res = metadata.requestHeaders().get(traceparentHeader());
+  return res.empty() ? absl::string_view{} : res[0]->value().getStringView();
+}
+} // namespace
+
 FilterStatus ConnectionManager::ActiveRpc::transportBegin(MessageMetadataSharedPtr metadata) {
+  // E2 TTHeader 解析完成，trace 在此刻才可知。
+  // 这一步同时把 E1 暂存的事件回填到该 trace，并确定后续点是否记录。
+  KITEX_PROBE_BIND(parent_.read_callbacks_->connection().id(),
+                   metadata->hasSequenceId() ? metadata->sequenceId() : 0,
+                   traceparentOf(*metadata), parent_.time_source_);
   return applyDecoderFilters(DecoderEvent::TransportBegin, metadata);
 }
 
@@ -746,6 +777,9 @@ FilterStatus ConnectionManager::ActiveRpc::transportEnd() {
 }
 
 void ConnectionManager::ActiveRpc::finalizeRequest() {
+  // E9 本次 RPC 在 Envoy 侧结束
+  KITEX_PROBE(parent_.read_callbacks_->connection().id(), "rpc_done", parent_.time_source_);
+  KITEX_PROBE_END(parent_.read_callbacks_->connection().id());
   pending_transport_end_ = false;
 
   parent_.stats_.request_.inc();
@@ -857,6 +891,9 @@ FilterStatus ConnectionManager::ActiveRpc::messageBegin(MessageMetadataSharedPtr
   metadata_ = metadata;
   original_sequence_id_ = metadata_->sequenceId();
   original_msg_type_ = metadata_->messageType();
+
+  // E3 协议层解出消息头，method name 在此刻可见
+  KITEX_PROBE(parent_.read_callbacks_->connection().id(), "msg_begin", parent_.time_source_);
 
   auto& connection = parent_.read_callbacks_->connection();
 
