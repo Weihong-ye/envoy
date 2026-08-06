@@ -3,6 +3,7 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/extensions/filters/network/thrift_proxy/ttheader_transport_impl.h"
 
+#include "test/extensions/filters/network/thrift_proxy/ttheader_fixtures.h"
 #include "test/test_common/printers.h"
 #include "test/test_common/utility.h"
 
@@ -309,6 +310,133 @@ TEST_F(TTHeaderTransportTest, RejectsInsaneFrameSize) {
   EXPECT_THROW_WITH_REGEX(transport_.decodeFrameStart(buffer, metadata), EnvoyException,
                           "invalid frame size");
 }
+
+// ---------------------------------------------------------------------------
+// 符合性:跑遍 Kitex 官方编码器生成的全部 fixture
+//
+// 与手工构造字节的区别:手工构造只能验证「实现符合我对协议的理解」，
+// 而这些字节来自 Kitex 真正会发出的编码器，验证的是「实现符合 Kitex 实际行为」。
+// ---------------------------------------------------------------------------
+
+class TTHeaderFixtureTest : public testing::TestWithParam<size_t> {
+protected:
+  TTHeaderTransportImpl transport_;
+};
+
+TEST_P(TTHeaderFixtureTest, MatchesKitexEncoder) {
+  const auto& f = TTHeaderFixtures::all()[GetParam()];
+  SCOPED_TRACE(absl::StrCat(f.name, ": ", f.why));
+
+  Buffer::OwnedImpl buffer;
+  buffer.add(f.bytes.data(), f.bytes.size());
+
+  MessageMetadata metadata(true);
+
+  if (f.should_fail) {
+    EXPECT_THROW(transport_.decodeFrameStart(buffer, metadata), EnvoyException)
+        << f.name << " 应被拒绝";
+    return;
+  }
+
+  ASSERT_TRUE(transport_.decodeFrameStart(buffer, metadata)) << f.name;
+  EXPECT_EQ(f.seq_id, metadata.sequenceId());
+  EXPECT_EQ(f.flags, metadata.headerFlags());
+  EXPECT_EQ(f.payload_len, metadata.frameSize()) << "frameSize 应等于 payload 长度";
+  EXPECT_EQ(f.payload_len, buffer.length()) << "解完 header 后 buffer 应只剩 payload";
+
+  // IntKV 应落到语义化 header 名下
+  for (const auto& [id, value] : f.int_info) {
+    const auto* name = TTHeaderIntKeyNames::get().fromId(id);
+    Http::LowerCaseString key =
+        name != nullptr ? *name
+                        : Http::LowerCaseString(absl::StrCat(
+                              TTHeaderTransportImpl::UnknownIntKeyPrefix, id));
+    const auto res = metadata.requestHeaders().get(key);
+    ASSERT_FALSE(res.empty()) << "缺少 IntKV id=" << id << " (" << key.get() << ")";
+    EXPECT_EQ(value, res[0]->value().getStringView()) << "IntKV id=" << id;
+  }
+
+  // StrKV 同样应完整还原。注意 header map 会把 key 小写化，
+  // metainfo 的大写前缀靠 formatter 在编码时还原（见 §9.1）。
+  for (const auto& [k, v] : f.str_info) {
+    const auto res = metadata.requestHeaders().get(Http::LowerCaseString(k));
+    ASSERT_FALSE(res.empty()) << "缺少 StrKV " << k;
+    EXPECT_EQ(v, res[0]->value().getStringView()) << "StrKV " << k;
+  }
+}
+
+// 每个 fixture 都必须能 decode → encode 回到逐字节相同的字节流。
+//
+// 注意 preserve_keys=true：Http::LowerCaseString 会强制小写，而 metainfo 的
+// 前缀是大写的(RPC_PERSIST_ / RPC_TRANSIT_ ...)。只有装上 ThriftCaseHeaderFormatter
+// (metadata.h:63，由配置项 header_keys_preserve_case 触发)才能还原原始大小写。
+// 不加这个参数，MetainfoUppercase 这一例会往返失真 —— 见下面那个专门的反例测试。
+TEST_P(TTHeaderFixtureTest, RoundTripsToIdenticalBytes) {
+  const auto& f = TTHeaderFixtures::all()[GetParam()];
+  if (f.should_fail) {
+    return;
+  }
+  SCOPED_TRACE(f.name);
+
+  Buffer::OwnedImpl original;
+  original.add(f.bytes.data(), f.bytes.size());
+  const std::string expected = hexOf(original);
+
+  Buffer::OwnedImpl buffer;
+  buffer.add(f.bytes.data(), f.bytes.size());
+  MessageMetadata metadata(true, /*preserve_keys=*/true);
+  ASSERT_TRUE(transport_.decodeFrameStart(buffer, metadata));
+
+  Buffer::OwnedImpl reencoded;
+  transport_.encodeFrame(reencoded, metadata, buffer);
+  EXPECT_EQ(expected, hexOf(reencoded)) << f.name << " 往返不保真";
+}
+
+// 反例：不开 preserve_keys 时，metainfo 的大写前缀会被静默改成小写。
+//
+// 这条不是「已知缺陷」，而是把一个配置要求固化成可执行规格：
+// Kitex 侧按大写前缀(RPC_PERSIST_ 等)做匹配，一旦被改成小写，
+// metainfo 会静默消失 —— 不报错、不告警、不掉包，是最难查的那类故障。
+// 因此 Envoy 配置必须开 header_keys_preserve_case。
+TEST(TTHeaderMetainfoCaseTest, CaseIsLostWithoutPreserveKeys) {
+  // 找到含大写 metainfo key 的那个 fixture
+  const TTHeaderFixtures::Fixture* target = nullptr;
+  for (const auto& f : TTHeaderFixtures::all()) {
+    if (std::string(f.name) == "MetainfoUppercase") {
+      target = &f;
+      break;
+    }
+  }
+  ASSERT_NE(nullptr, target) << "fixture MetainfoUppercase 缺失";
+
+  TTHeaderTransportImpl transport;
+
+  auto round_trip = [&](bool preserve_keys) {
+    Buffer::OwnedImpl buffer;
+    buffer.add(target->bytes.data(), target->bytes.size());
+    MessageMetadata metadata(true, preserve_keys);
+    EXPECT_TRUE(transport.decodeFrameStart(buffer, metadata));
+    Buffer::OwnedImpl out;
+    transport.encodeFrame(out, metadata, buffer);
+    return hexOf(out);
+  };
+
+  Buffer::OwnedImpl original;
+  original.add(target->bytes.data(), target->bytes.size());
+  const std::string expected = hexOf(original);
+
+  EXPECT_EQ(expected, round_trip(true)) << "开启 preserve_keys 后应逐字节保真";
+  EXPECT_NE(expected, round_trip(false))
+      << "未开 preserve_keys 却保真了？说明 header 大小写行为已变，"
+         "§9.1 的结论和 header_keys_preserve_case 的必要性需要重新评估";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    KitexFixtures, TTHeaderFixtureTest,
+    testing::Range(size_t{0}, TTHeaderFixtures::all().size()),
+    [](const testing::TestParamInfo<size_t>& info) {
+      return std::string(TTHeaderFixtures::all()[info.param].name);
+    });
 
 // ---------------------------------------------------------------------------
 // 静态映射表

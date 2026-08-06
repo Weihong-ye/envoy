@@ -146,7 +146,10 @@ envoy_extension_cc_test(
 
 envoy_extension_cc_test(
     name = "ttheader_transport_impl_test",
-    srcs = ["ttheader_transport_impl_test.cc"],
+    srcs = [
+        "ttheader_fixtures.h",
+        "ttheader_transport_impl_test.cc",
+    ],
     extension_names = ["envoy.filters.network.thrift_proxy"],
     rbe_pool = "6gig",
     deps = [
