@@ -439,6 +439,93 @@ INSTANTIATE_TEST_SUITE_P(
     });
 
 // ---------------------------------------------------------------------------
+// TTHeaderFramed:载荷前的内层 4 字节长度前缀
+//
+// Kitex 的 transport.TTHeaderFramed(= TTHeader | Framed)会在 TTHeader 之后、
+// 载荷之前再插一个 4 字节长度前缀。这不是边角情况 —— 实测中 Kitex client
+// 即使显式设 transport.TTHeader，最终生效的也是 TTHeader|Framed
+// （SetTransportProtocol 内部是 |= 而非赋值，kitex rpcconfig.go:178）。
+//
+// 不处理的话，Protocol 层会从长度前缀开始读版本号，
+// 报 "invalid binary protocol version 0x0000"。
+// ---------------------------------------------------------------------------
+
+// 构造一帧 TTHeaderFramed：在 kKitexBasicFrame 的载荷前插入 4 字节长度，
+// 并相应调大 LENGTH 字段。
+std::vector<uint8_t> makeFramedVariant() {
+  const std::vector<uint8_t> base(kKitexBasicFrame, kKitexBasicFrame + sizeof(kKitexBasicFrame));
+  // 原载荷是 5 字节的 01..05，替换成「4 字节长度 + 一条最小 thrift binary 消息」，
+  // 否则魔数探测认不出来。
+  const std::vector<uint8_t> msg = {0x80, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00,
+                                    0x00, 0x00, 0x00, 0x00, 0x01, 0x00};
+  std::vector<uint8_t> out(base.begin(), base.begin() + 26); // 头 14 + header info 12
+  out.push_back(static_cast<uint8_t>(msg.size() >> 24));
+  out.push_back(static_cast<uint8_t>(msg.size() >> 16));
+  out.push_back(static_cast<uint8_t>(msg.size() >> 8));
+  out.push_back(static_cast<uint8_t>(msg.size()));
+  out.insert(out.end(), msg.begin(), msg.end());
+  // 回填 LENGTH = 总长 - 4
+  const uint32_t len = static_cast<uint32_t>(out.size() - 4);
+  out[0] = static_cast<uint8_t>(len >> 24);
+  out[1] = static_cast<uint8_t>(len >> 16);
+  out[2] = static_cast<uint8_t>(len >> 8);
+  out[3] = static_cast<uint8_t>(len);
+  return out;
+}
+
+TEST_F(TTHeaderTransportTest, StripsInnerFramedPrefix) {
+  const auto frame = makeFramedVariant();
+  Buffer::OwnedImpl buffer;
+  addBytes(buffer, frame.data(), frame.size());
+
+  MessageMetadata metadata(true, /*preserve_keys=*/true);
+  ASSERT_TRUE(transport_.decodeFrameStart(buffer, metadata));
+
+  // 剥掉前缀后，buffer 应直接以 thrift 魔数开头，Protocol 层才认得
+  ASSERT_GE(buffer.length(), 4);
+  EXPECT_EQ(0x80010001u, buffer.peekBEInt<uint32_t>(0))
+      << "剥掉内层前缀后应直接是 thrift binary 消息";
+  EXPECT_EQ(buffer.length(), metadata.frameSize()) << "frameSize 应已扣除前缀";
+}
+
+TEST_F(TTHeaderTransportTest, RestoresInnerFramedPrefixOnEncode) {
+  const auto frame = makeFramedVariant();
+  Buffer::OwnedImpl original;
+  addBytes(original, frame.data(), frame.size());
+  const std::string expected = hexOf(original);
+
+  Buffer::OwnedImpl buffer;
+  addBytes(buffer, frame.data(), frame.size());
+  MessageMetadata metadata(true, /*preserve_keys=*/true);
+  ASSERT_TRUE(transport_.decodeFrameStart(buffer, metadata));
+
+  Buffer::OwnedImpl reencoded;
+  transport_.encodeFrame(reencoded, metadata, buffer);
+
+  // 代理应当透明：带前缀进来就要带前缀出去，逐字节保真。
+  // Kitex 两种形态都能自动识别，所以不还原也能跑通 —— 但那样 Envoy
+  // 就成了会改写报文的中间人，抓包比对也失去意义。
+  EXPECT_EQ(expected, hexOf(reencoded));
+  // 内部标记不得泄漏到线上
+  EXPECT_EQ(std::string::npos, hexOf(reencoded).find("782d74742d6672616d6564"))
+      << "x-tt-framed-payload 标记不应出现在编码结果中";
+}
+
+TEST_F(TTHeaderTransportTest, LeavesUnframedPayloadAlone) {
+  // 原始 fixture 的载荷不是 thrift 消息（就是 01 02 03 04 05），
+  // 魔数探测两段都不命中，应保持原样不动。
+  Buffer::OwnedImpl buffer;
+  addBytes(buffer, kKitexBasicFrame, sizeof(kKitexBasicFrame));
+  MessageMetadata metadata(true, /*preserve_keys=*/true);
+  ASSERT_TRUE(transport_.decodeFrameStart(buffer, metadata));
+  EXPECT_EQ(5, metadata.frameSize()) << "无内层前缀时 frameSize 不应被改动";
+  EXPECT_TRUE(metadata.requestHeaders()
+                  .get(TTHeaderTransportImpl::framedPayloadMarker())
+                  .empty())
+      << "无内层前缀时不应打标记";
+}
+
+// ---------------------------------------------------------------------------
 // 静态映射表
 // ---------------------------------------------------------------------------
 

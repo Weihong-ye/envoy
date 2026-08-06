@@ -91,6 +91,34 @@ public:
   // 未知 IntKV id 的 header 名前缀（冷路径 fallback）。
   static constexpr absl::string_view UnknownIntKeyPrefix = "x-ttheader-int-";
 
+  // Kitex 用来识别载荷类型的魔数，取自 kitex pkg/remote/codec/default_codec.go:42-48。
+  static constexpr uint32_t ThriftV1Magic = 0x80010000;
+  static constexpr uint32_t ProtobufV1Magic = 0x90010000;
+  static constexpr uint32_t MagicMask = 0xFFFF0000;
+
+  // Kitex 的 transport.TTHeaderFramed（= TTHeader | Framed）会在 TTHeader 之后、
+  // 载荷之前再插一个 4 字节长度前缀。这个前缀是冗余的（TTHeader 的 LENGTH 字段
+  // 已经能推出载荷长度），但 Kitex 实际会发，且 TTHeaderFramed 是它的具名常量，
+  // 说明这是常规配置而非边角情况，因此必须支持。
+  //
+  // 判定方式与 Kitex 自己一致（default_codec.go:380-397 checkPayload）：
+  // 峰值载荷前 8 字节，看 thrift 魔数落在哪一段。
+  //   bytes[0:4] 命中 → 无内层前缀
+  //   bytes[4:8] 命中 → 有内层前缀，需跳过 4 字节
+  //
+  // 返回 true 表示存在内层 framed 前缀。数据不足 8 字节时返回 false（保守处理）。
+  static bool payloadHasFramedPrefix(Buffer::Instance& buffer, uint32_t payload_len);
+
+  // 记录「原始报文带内层 framed 前缀」的保留 header。
+  //
+  // 之所以要记而不是一律剥掉：代理应当透明，不该悄悄改变载荷分帧。
+  // Kitex 的解码器两种形态都能自动识别（checkPayload 做同样的峰值探测），
+  // 所以不还原也能跑通，但那样 Envoy 就成了会改写报文的中间人，
+  // 往返不再保真，也让抓包比对失去意义。
+  //
+  // 该 header 仅存在于 Envoy 进程内，encodeFrame 会消费掉它，不会写到线上。
+  static const Http::LowerCaseString& framedPayloadMarker();
+
 private:
   static uint16_t drainUint16(Buffer::Instance& buffer, int32_t& remaining, const char* what);
   static uint8_t drainUint8(Buffer::Instance& buffer, int32_t& remaining, const char* what);

@@ -37,6 +37,23 @@ std::string sanitizeKey(std::string key) {
 
 } // namespace
 
+const Http::LowerCaseString& TTHeaderTransportImpl::framedPayloadMarker() {
+  CONSTRUCT_ON_FIRST_USE(Http::LowerCaseString, "x-tt-framed-payload");
+}
+
+bool TTHeaderTransportImpl::payloadHasFramedPrefix(Buffer::Instance& buffer, uint32_t payload_len) {
+  // 需要 8 字节才能判定：前 4 字节是魔数则无前缀，后 4 字节是魔数则有前缀。
+  if (payload_len < 8 || buffer.length() < 8) {
+    return false;
+  }
+  const uint32_t first = buffer.peekBEInt<uint32_t>(0);
+  if ((first & MagicMask) == ThriftV1Magic || (first & MagicMask) == ProtobufV1Magic) {
+    return false; // 载荷直接就是消息，无内层前缀
+  }
+  const uint32_t second = buffer.peekBEInt<uint32_t>(4);
+  return (second & MagicMask) == ThriftV1Magic || (second & MagicMask) == ProtobufV1Magic;
+}
+
 const std::string& TTHeaderTransportImpl::aclTokenKey() {
   // 与 kitex/pkg/remote/transmeta/metakey.go 的 GDPRToken 一致：
   // metainfo.PrefixTransient("RPC_TRANSIT_") + "gdpr-token"
@@ -288,6 +305,20 @@ bool TTHeaderTransportImpl::decodeFrameStart(Buffer::Instance& buffer, MessageMe
     buffer.drain(remaining);
   }
 
+  // Kitex 的 TTHeaderFramed 会在载荷前再插一个 4 字节长度前缀。
+  // Protocol 层期望直接看到 thrift 消息，所以这里剥掉，
+  // 并打标记以便 encodeFrame 原样还原（保持代理透明）。
+  const uint32_t payload_len = metadata.frameSize();
+  if (payloadHasFramedPrefix(buffer, payload_len)) {
+    buffer.drain(4);
+    metadata.setFrameSize(payload_len - 4);
+    if (is_request) {
+      metadata.requestHeaders().addReferenceKey(framedPayloadMarker(), "1");
+    } else {
+      metadata.responseHeaders().addReferenceKey(framedPayloadMarker(), "1");
+    }
+  }
+
   return true;
 }
 
@@ -315,6 +346,7 @@ void TTHeaderTransportImpl::encodeFrame(Buffer::Instance& buffer, const MessageM
   std::vector<std::pair<std::string, std::string>> str_kvs;
   std::string acl_token;
   bool has_acl_token = false;
+  bool restore_framed_prefix = false;
 
   const auto& int_names = TTHeaderIntKeyNames::get();
 
@@ -322,6 +354,12 @@ void TTHeaderTransportImpl::encodeFrame(Buffer::Instance& buffer, const MessageM
     // header map 里的 key 已是小写，直接按 string_view 比较，不构造 LowerCaseString。
     const absl::string_view raw_key = header.key().getStringView();
     const absl::string_view value = header.value().getStringView();
+
+    // 内部标记：消费掉，不写到线上（decodeFrameStart 打的）
+    if (raw_key == framedPayloadMarker().get()) {
+      restore_framed_prefix = true;
+      return Http::HeaderMap::Iterate::Continue;
+    }
 
     uint16_t id = 0;
     if (int_names.toId(raw_key, id)) {
@@ -411,7 +449,10 @@ void TTHeaderTransportImpl::encodeFrame(Buffer::Instance& buffer, const MessageM
     throw EnvoyException(absl::StrCat("ttheader: header too large ", header_size));
   }
 
-  const uint64_t frame_size = header_size + msg_size + MetaSizeNoLength;
+  // 还原内层 framed 前缀（若原始报文有）。它计入 TTHeader 的 LENGTH。
+  const uint64_t framed_prefix_size = restore_framed_prefix ? 4 : 0;
+
+  const uint64_t frame_size = header_size + framed_prefix_size + msg_size + MetaSizeNoLength;
   if (frame_size > static_cast<uint64_t>(MaxFrameSize)) {
     throw EnvoyException(absl::StrCat("ttheader: frame too large ", frame_size));
   }
@@ -423,6 +464,9 @@ void TTHeaderTransportImpl::encodeFrame(Buffer::Instance& buffer, const MessageM
   buffer.writeBEInt<uint16_t>(static_cast<uint16_t>(header_size / 4));
 
   buffer.move(header_buffer);
+  if (restore_framed_prefix) {
+    buffer.writeBEInt<uint32_t>(static_cast<uint32_t>(msg_size));
+  }
   buffer.move(message);
 }
 
