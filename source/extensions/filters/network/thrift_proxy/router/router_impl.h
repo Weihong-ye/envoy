@@ -253,6 +253,12 @@ public:
   }
   Buffer::OwnedImpl& buffer() override { return upstream_request_buffer_; }
   Event::Dispatcher& dispatcher() override { return callbacks_->dispatcher(); }
+  uint64_t downstreamConnectionId() const override {
+    return callbacks_ != nullptr && callbacks_->connection() != nullptr
+               ? callbacks_->connection()->id()
+               : 0;
+  }
+
   void addSize(uint64_t size) override { request_size_ += size; }
   void continueDecoding() override { callbacks_->continueDecoding(); }
   void resetDownstreamConnection() override { callbacks_->resetDownstreamConnection(); }

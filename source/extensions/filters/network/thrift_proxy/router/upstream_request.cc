@@ -1,5 +1,7 @@
 #include "source/extensions/filters/network/thrift_proxy/router/upstream_request.h"
 
+#include "source/common/kitex_probe/probe.h"
+
 #include "source/extensions/filters/network/thrift_proxy/app_exception_impl.h"
 
 namespace Envoy {
@@ -80,6 +82,11 @@ void UpstreamRequest::onPoolReady(Tcp::ConnectionPool::ConnectionDataPtr&& conn_
                                   Upstream::HostDescriptionConstSharedPtr host) {
   // Only invoke continueDecoding if we'd previously stopped the filter chain.
   bool continue_decoding = conn_pool_handle_ != nullptr;
+
+  // 上游连接就绪。conn_pool_handle_ 非空表示本次是等待连接池分配后才到这里
+  // （新建或排队），为空表示同步命中已有连接 —— 这个区别是建连成本归因的关键。
+  KITEX_PROBE(parent_.downstreamConnectionId(),
+              continue_decoding ? "up_conn_new" : "up_conn_reused", parent_.dispatcher().timeSource());
 
   onUpstreamHostSelected(host);
   host->outlierDetector().putResult(Upstream::Outlier::Result::LocalOriginConnectSuccess);
@@ -249,12 +256,17 @@ void UpstreamRequest::onEvent(Network::ConnectionEvent event) {
 uint64_t UpstreamRequest::encodeAndWrite(Buffer::OwnedImpl& request_buffer) {
   Buffer::OwnedImpl transport_buffer;
 
+  const uint64_t dn_id = parent_.downstreamConnectionId();
+
   metadata_->setProtocol(protocol_->type());
   transport_->encodeFrame(transport_buffer, *metadata_, request_buffer);
+  // 编码与写出原本合在一个区间里（7～16µs），分不清是编码慢还是写慢
+  KITEX_PROBE(dn_id, "up_encode_done", parent_.dispatcher().timeSource());
 
   uint64_t size = transport_buffer.length();
 
   conn_data_->connection().write(transport_buffer, false);
+  KITEX_PROBE(dn_id, "up_socket_write_done", parent_.dispatcher().timeSource());
 
   return size;
 }

@@ -468,6 +468,14 @@ public:
   virtual void addSize(uint64_t size) PURE;
 
   /**
+   * 下游连接 id，供端到端打点把上游侧事件关联回同一条 RPC。
+   *
+   * 默认返回 0（表示不可用）：影子流量等场景不需要打点，
+   * 只有真实的 Router 覆盖它。这样新增插桩不必改动所有实现类。
+   */
+  virtual uint64_t downstreamConnectionId() const { return 0; }
+
+  /**
    * Used to continue decoding if it was previously stopped.
    */
   virtual void continueDecoding() PURE;
