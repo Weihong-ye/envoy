@@ -171,6 +171,9 @@ void ConnectionManager::doDeferredRpcDestroy(ConnectionManager::ActiveRpc& rpc) 
   if (!rpc.inserted()) {
     return;
   }
+  // RPC 真正结束（响应已回或被重置）才释放探针绑定。
+  KITEX_PROBE(read_callbacks_->connection().id(), "rpc_done", time_source_);
+  KITEX_PROBE_END(read_callbacks_->connection().id());
 
   read_callbacks_->connection().dispatcher().deferredDelete(rpc.removeFromList(rpcs_));
   if (requests_overflow_ && rpcs_.empty()) {
@@ -777,9 +780,14 @@ FilterStatus ConnectionManager::ActiveRpc::transportEnd() {
 }
 
 void ConnectionManager::ActiveRpc::finalizeRequest() {
-  // E9 本次 RPC 在 Envoy 侧结束
-  KITEX_PROBE(parent_.read_callbacks_->connection().id(), "rpc_done", parent_.time_source_);
-  KITEX_PROBE_END(parent_.read_callbacks_->connection().id());
+  // E9 请求侧处理完成。
+  //
+  // 注意这里**不能**调 KITEX_PROBE_END：finalizeRequest 是「请求」处理完，
+  // 不是「RPC」完成 —— 对普通 Call，下面的 destroy_rpc 为 false，
+  // RPC 还要继续等上游响应。早先在此擦除 binding，导致响应侧的
+  // up_first_byte 与 resp_decoded 查不到 binding 而被静默丢弃，
+  // 整个响应路径没有任何数据。绑定的释放放到 doDeferredRpcDestroy。
+  KITEX_PROBE(parent_.read_callbacks_->connection().id(), "req_done", parent_.time_source_);
   pending_transport_end_ = false;
 
   parent_.stats_.request_.inc();
