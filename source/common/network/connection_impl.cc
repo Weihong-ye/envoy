@@ -718,14 +718,24 @@ void ConnectionImpl::setFailureReason(absl::string_view failure_reason) {
 }
 
 void ConnectionImpl::onFileEvent(uint32_t events) {
-  // epoll 唤醒后用户态第一个可记录的时刻。放在函数最前面（先于 ScopeTracker），
-  // 因为这个点的全部意义就是「尽可能早」——它是把「真正在等对端」和
-  // 「已经醒了但还没读到」切开的那一刀。
+  // epoll 唤醒时刻。
+  //
+  // 取 approximateMonotonicTime 而**不是**当前时间：它由 libevent 的 check 回调
+  // （DispatcherImpl 构造时注册的 updateApproximateMonotonicTime）更新，
+  // 时刻正是事件后端返回、尚未派发任何回调的那一瞬间。
+  //
+  // 初版这里取的是「现在」，结果是错的：onFileEvent 入口已经在 libevent
+  // 分发到本连接**之后**，于是 up_epoll_wake→up_readv_start 只剩下几百纳秒的
+  // 分支开销，恒定不变。实测把 Envoy worker 从 384 压到 2、端到端劣化 5.1 倍时，
+  // 这一段反而从 290ns 降到 180ns —— 真正的排队全发生在它前面，没被覆盖。
+  // 换成 approximateMonotonicTime 后，这一段才真正等于
+  // 「epoll 返回 → 轮到本连接」，即事件循环内的排队。
+  //
+  // 顺带还省了一次 clock_gettime：这个值本来就是缓存好的。
   //
   // 只对读就绪打点：写就绪走 onWriteReady 另一条路径，混进来会污染分解。
-  // 未采样时 kitex_probe_dn_id_ 为 0，整个判断就是一次成员读加一次分支。
   if (kitex_probe_on_ && (events & Event::FileReadyType::Read)) {
-    KITEX_PROBE(kitex_probe_dn_id_, "up_epoll_wake", dispatcher_.timeSource());
+    KITEX_PROBE_AT(kitex_probe_dn_id_, "up_epoll_wake", dispatcher_.approximateMonotonicTime());
   }
 
   ScopeTrackerScopeState scope(this, this->dispatcher_);

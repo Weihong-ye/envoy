@@ -115,6 +115,12 @@ Stats stats();
 
 #define KITEX_PROBE_SAMPLED(conn_id) ::Envoy::KitexProbe::isSampled((conn_id))
 
+// 记录一个**已经采好**的时刻，而不是「现在」。
+// 用于时刻来自别处的场景，例如 epoll 返回的时间由 libevent 的 check 回调
+// 提前记下（Envoy 的 approximateMonotonicTime），到 onFileEvent 里再补记。
+#define KITEX_PROBE_AT(conn_id, point, mono)                                                       \
+  ::Envoy::KitexProbe::rpcEvent((conn_id), (point), (mono))
+
 #else
 
 #define KITEX_PROBE_CONN(conn_id, point, time_source)                                              \
@@ -130,5 +136,8 @@ Stats stats();
   do {                                                                                             \
   } while (0)
 #define KITEX_PROBE_SAMPLED(conn_id) false
+#define KITEX_PROBE_AT(conn_id, point, mono)                                                       \
+  do {                                                                                             \
+  } while (0)
 
 #endif
