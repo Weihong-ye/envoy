@@ -168,7 +168,12 @@ public:
   StreamInfo::DetectedCloseType detectedCloseType() const override { return detected_close_type_; }
 
   // 打点专用，见 Network::Connection 上的说明。
-  void setKitexProbeDownstreamId(uint64_t dn_id) override { kitex_probe_dn_id_ = dn_id; }
+  void enableKitexProbe(uint64_t dn_id) override {
+    kitex_probe_dn_id_ = dn_id;
+    kitex_probe_on_ = true;
+  }
+  void disableKitexProbe() override { kitex_probe_on_ = false; }
+  bool kitexProbeEnabled() const override { return kitex_probe_on_; }
   uint64_t kitexProbeDownstreamId() const override { return kitex_probe_dn_id_; }
 
 protected:
@@ -228,8 +233,9 @@ protected:
   ConnectionEvent immediate_error_event_{ConnectionEvent::Connected};
   bool bind_error_{false};
 
-  // 打点门控：非 0 时表示本连接正在服务一条被采样的 RPC，值为其下游 conn_id。
-  // 读路径热点上只做「读成员 + 判零」，不引入任何查找。
+  // 打点门控。开关与取值分开：conn_id 为 0 是合法值，不能当哨兵（见接口处说明）。
+  // 读路径热点上只做「读一个 bool + 判真」，不引入任何查找。
+  bool kitex_probe_on_{false};
   uint64_t kitex_probe_dn_id_{0};
 
 private:

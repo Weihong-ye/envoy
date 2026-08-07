@@ -724,7 +724,7 @@ void ConnectionImpl::onFileEvent(uint32_t events) {
   //
   // 只对读就绪打点：写就绪走 onWriteReady 另一条路径，混进来会污染分解。
   // 未采样时 kitex_probe_dn_id_ 为 0，整个判断就是一次成员读加一次分支。
-  if (kitex_probe_dn_id_ != 0 && (events & Event::FileReadyType::Read)) {
+  if (kitex_probe_on_ && (events & Event::FileReadyType::Read)) {
     KITEX_PROBE(kitex_probe_dn_id_, "up_epoll_wake", dispatcher_.timeSource());
   }
 
@@ -814,7 +814,7 @@ void ConnectionImpl::onReadReady() {
   // 「N 次 readv + N 次 buffer append」的总和，不是单次系统调用。
   // 对 thrift 小报文 N 通常为 2（一次拿到数据，一次拿到 EAGAIN）。
   // 若实测这段异常大，再往 RawBufferSocket 循环内部钻。
-  const bool probe = kitex_probe_dn_id_ != 0;
+  const bool probe = kitex_probe_on_;
   if (probe) {
     KITEX_PROBE(kitex_probe_dn_id_, "up_readv_start", dispatcher_.timeSource());
   }

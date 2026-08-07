@@ -59,7 +59,7 @@ void UpstreamRequest::releaseConnection(const bool close) {
   // 归还连接池前摘掉打点标志：连接空闲期的 epoll 事件（对端关连接、keepalive 等）
   // 不属于任何 RPC，留着会污染下一条 trace。
   if (conn_data != nullptr) {
-    conn_data->connection().setKitexProbeDownstreamId(0);
+    conn_data->connection().disableKitexProbe();
   }
   if (close && conn_data != nullptr) {
     conn_data->connection().close(Network::ConnectionCloseType::NoFlush);
@@ -106,7 +106,7 @@ void UpstreamRequest::onPoolReady(Tcp::ConnectionPool::ConnectionDataPtr&& conn_
   // ConnectionImpl 里只多一次判零。连接是从池子里取的，可能刚服务过别的请求，
   // 所以是覆盖而非追加；释放时必须清零（见 releaseConnection / onResponseComplete）。
   if (KITEX_PROBE_SAMPLED(parent_.downstreamConnectionId())) {
-    conn_data_->connection().setKitexProbeDownstreamId(parent_.downstreamConnectionId());
+    conn_data_->connection().enableKitexProbe(parent_.downstreamConnectionId());
   }
 
   conn_state_ = conn_data_->connectionStateTyped<ThriftConnectionState>();
@@ -311,7 +311,7 @@ void UpstreamRequest::onResponseComplete() {
   conn_state_ = nullptr;
   // 正常完成走的是这条路径，绕开了 releaseConnection，所以标志要在这里也清一次。
   if (conn_data_ != nullptr) {
-    conn_data_->connection().setKitexProbeDownstreamId(0);
+    conn_data_->connection().disableKitexProbe();
   }
   conn_data_.reset();
 }

@@ -227,8 +227,16 @@ public:
    * 且绝大多数取值为 0，分支预测几乎必中。
    *
    * 带默认实现，因此各类 mock/fake/装饰器连接无需改动。
+   *
+   * **开关与取值必须分开。** 初版把「0」当作未采样的哨兵，实测直接翻车：
+   * ConnectionImpl::next_global_id_ 从 0 开始，进程里第一条连接的 id 就是 0，
+   * 于是「采样命中且下游 conn_id 为 0」和「未采样」完全无法区分。
+   * 繁忙的 Envoy 上这只影响第一条连接，本实验只有一条下游连接，
+   * 结果就是 100% 丢数据 —— 而且不报错，表现为「点位一条都没有」。
    */
-  virtual void setKitexProbeDownstreamId(uint64_t) {}
+  virtual void enableKitexProbe(uint64_t) {}
+  virtual void disableKitexProbe() {}
+  virtual bool kitexProbeEnabled() const { return false; }
   virtual uint64_t kitexProbeDownstreamId() const { return 0; }
 
   /**
