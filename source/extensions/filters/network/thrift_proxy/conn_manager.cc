@@ -200,6 +200,21 @@ void ConnectionManager::initializeReadFilterCallbacks(Network::ReadFilterCallbac
 
   read_callbacks_->connection().addConnectionCallbacks(*this);
   read_callbacks_->connection().enableHalfClose(true);
+
+  // 打开下游连接的读路径点位（dn_epoll_wake / dn_readv_start / dn_readv_done）。
+  //
+  // **无条件开启，不查采样** —— 下游读发生时 TTHeader 还没解析，采样状态
+  // 在物理上不可知。所以下游侧走的是覆盖式时间戳槽位而非事件队列，
+  // 未采样请求的代价是一次哈希查找加一次 store（见 probe.h 的 connSlot）。
+  //
+  // 这里传的 conn_id 就是下游 conn_id 自己，与 bindTrace / endRpc 用的键一致。
+  //
+  // 先判 enabled()：上游侧是「查采样」时顺带就不会开，下游侧没这道关卡，
+  // 不判的话未配置探针时 kitex_probe_on_ 也会被置真，读路径上白白多一次
+  // 立刻返回的函数调用 —— §8.6 的对照组要的是「一点都不激活」。
+  if (::Envoy::KitexProbe::enabled()) {
+    read_callbacks_->connection().enableKitexProbe(read_callbacks_->connection().id());
+  }
 }
 
 void ConnectionManager::onEvent(Network::ConnectionEvent event) {
@@ -294,9 +309,17 @@ void ConnectionManager::ResponseDecoder::finalizeResponse() {
 
   metadata_->setProtocol(cm.decoder_->protocolType());
   transport->encodeFrame(buffer, *metadata_, parent_.response_buffer_);
+  // 下游响应帧编码完成。与上游侧的 up_encode_done 对称，把「编码」与「写 socket」
+  // 分开 —— 合在一起的话分不清是序列化慢还是 socket 慢。
+  KITEX_PROBE(cm.read_callbacks_->connection().id(), "dn_encode_done",
+              parent_.parent_.time_source_);
   complete_ = true;
 
   cm.read_callbacks_->connection().write(buffer, false);
+  // 响应已写回下游 socket（本实验是 UDS）。这是本跳最后一个 socket 边界，
+  // 在此之前整条下游发送路径都不可见。
+  KITEX_PROBE(cm.read_callbacks_->connection().id(), "dn_socket_write_done",
+              parent_.parent_.time_source_);
 
   cm.stats_.response_.inc();
   if (passthrough_) {

@@ -237,6 +237,16 @@ protected:
   // 读路径热点上只做「读一个 bool + 判真」，不引入任何查找。
   bool kitex_probe_on_{false};
   uint64_t kitex_probe_dn_id_{0};
+  // 本连接是上游（主动发起）还是下游（被 accept）。决定读路径打 up_* 还是 dn_*。
+  //
+  // 由 ClientConnectionImpl 的构造函数置真，**不走 enableKitexProbe 传参** ——
+  // 那样要改 envoy/network/connection.h 这个核心接口头，实测触发 1134 个动作的
+  // 大范围重编，而且多一处 rebase 冲突点（probe.h 开宗明义要求插桩易摘除）。
+  // 「主动发起的连接是 ClientConnectionImpl，被 accept 的不是」这个区分是现成的。
+  //
+  // 注意它覆盖全进程所有主动发起的连接（xDS、健康检查等），但只在
+  // kitex_probe_on_ 为真时才被读到，而那个标志只有两处会显式打开，不会误伤。
+  bool kitex_probe_upstream_{false};
 
 private:
   friend class MultiConnectionBaseImpl;

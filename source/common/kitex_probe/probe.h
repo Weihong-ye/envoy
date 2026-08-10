@@ -55,6 +55,22 @@ void bindTrace(uint64_t conn_id, int32_t seq_id, absl::string_view traceparent,
                MonotonicTime mono, SystemTime wall);
 
 /**
+ * 下游读路径的时间戳槽位。
+ *
+ * 下游读发生时 TTHeader 还没解析，traceparent 还在字节流里，**采样状态在物理上
+ * 不可知** —— 所以既不能像 up_* 那样「查一次采样、挂裸标志」，也不该像
+ * connEvent 那样往 pending vector 里塞完整 Event（3 个点 × 99% 未采样请求 =
+ * 白做的 push_back 与可能的扩容，违反「未采样近乎零开销」这条设计约束）。
+ *
+ * 改为每连接固定三个 int64 槽位，覆盖式写入：未采样的代价是一次哈希查找加一次
+ * store，零分配。bindTrace 时若确认采样，再把槽位转成事件。
+ *
+ * 与 Kitex 侧 netpoll 探针的「时间戳槽位」是同一个模式。
+ */
+enum class Slot { DnEpollWake, DnReadvStart, DnReadvDone };
+void connSlot(uint64_t conn_id, Slot which, MonotonicTime mono);
+
+/**
  * 记录一个 RPC 级事件。内部先查采样状态，未采样立即返回。
  *
  * 只取单调时钟。wall clock 由 bindTrace 时记下的基准点加上 mono 差值推算 ——
@@ -83,6 +99,15 @@ void endRpc(uint64_t conn_id);
  * 这样单测和未启用打点的部署不会产生副作用。
  */
 void configure(const std::string& path, const std::string& node);
+
+/**
+ * 探针是否已启用（即是否设了 KITEX_PROBE_PATH）。
+ *
+ * 供调用方**在开启连接级门控之前**判断，好让未启用时连
+ * `kitex_probe_on_` 都保持为假 —— §8.6 的对照组要的是「探针代码在二进制里
+ * 但一点都不激活」，读路径上连一次函数调用都不该多做。
+ */
+bool enabled();
 
 /** 刷盘。进程退出前调用。 */
 void flush();
@@ -121,6 +146,10 @@ Stats stats();
 #define KITEX_PROBE_AT(conn_id, point, mono)                                                       \
   ::Envoy::KitexProbe::rpcEvent((conn_id), (point), (mono))
 
+// 写下游读路径的时间戳槽位。与 KITEX_PROBE_AT 一样接受「已经采好的时刻」。
+#define KITEX_PROBE_SLOT(conn_id, slot, mono)                                                      \
+  ::Envoy::KitexProbe::connSlot((conn_id), ::Envoy::KitexProbe::Slot::slot, (mono))
+
 #else
 
 #define KITEX_PROBE_CONN(conn_id, point, time_source)                                              \
@@ -137,6 +166,9 @@ Stats stats();
   } while (0)
 #define KITEX_PROBE_SAMPLED(conn_id) false
 #define KITEX_PROBE_AT(conn_id, point, mono)                                                       \
+  do {                                                                                             \
+  } while (0)
+#define KITEX_PROBE_SLOT(conn_id, slot, mono)                                                      \
   do {                                                                                             \
   } while (0)
 

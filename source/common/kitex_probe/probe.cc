@@ -81,14 +81,44 @@ struct Binding {
   int64_t base_wall{0};
 };
 
+// 下游读路径的三个时间戳，每连接一份，覆盖式写入。
+//
+// 用固定槽位而不是 pending vector：见 probe.h 里 connSlot 的注释。
+// 0 表示「本次没记到」—— 例如响应与请求落在同一次 readv 里、
+// 或连接复用后压根没有新的 epoll 唤醒。取的时候按 0 跳过，**不补零**：
+// 补零会把「没发生」画成「耗时 0」。
+struct ConnSlots {
+  int64_t epoll_wake{0};
+  int64_t readv_start{0};
+  int64_t readv_done{0};
+};
+
 // 每 worker 线程一份。Envoy 的 worker 是单线程事件循环，
 // 所以这里既不需要锁，也不存在伪共享。
 class ThreadState {
 public:
+  // 线程退出时把本线程剩余的事件落盘。**这是收尾的唯一正确位置**：
+  // 稳态路径完全不必为此付出代价，而且刷的是自己的缓冲区，
+  // 与「主线程在 atexit 里去刷别人的 vector」不同，不存在数据竞争。
+  //
+  // 必须挂在 ThreadState 上，不能像以前那样单独搞一个命名空间作用域的
+  // `thread_local ThreadFlusher`：那种写法**从来没生效过** ——
+  // 命名空间作用域的 thread_local 只在被 odr-use 时才初始化，
+  // 而那个对象全代码没有任何地方引用它，于是永远不构造、
+  // __cxa_thread_atexit 永远不注册、析构永远不跑。
+  // 表现为流量停止后尾部事件静默丢失（实测 1000 请求丢最后 10 条，
+  // 落盘量恰好卡在 FlushThreshold 的整数倍）。
+  // tls() 里的 `static thread_local ThreadState` 是**函数局部**的，
+  // 首次调用必定构造，因此挂在这里的析构有保证。
+  ~ThreadState();
+
   // E1 用：此刻还不知道 trace，先按连接暂存。
   // 一条连接上同时最多有少量待定事件（通常 1 个），用小 vector 足够。
   absl::flat_hash_map<uint64_t, std::vector<Event>> pending;
   absl::flat_hash_map<uint64_t, Binding> bindings;
+  // 下游读的时间戳槽位，与 pending 一样按下游 conn_id 索引，
+  // 同样在 endRpc 里清理，避免随连接数无界增长。
+  absl::flat_hash_map<uint64_t, ConnSlots> slots;
   std::vector<Event> ready;
   int64_t last_flush_ns{0};
   // 每个 worker 线程写自己的文件。
@@ -123,6 +153,11 @@ struct Config {
   bool enabled{false};
 };
 
+// 进程退出时把探针自身的统计写进 stderr（即 Envoy 的日志，
+// run-*.sh 会 `tee` 进 envoy-*.log）。定义在下面，这里只前置声明 ——
+// config() 在初始化时注册它。
+void reportStatsAtExit();
+
 Config& config() {
   static Config c = [] {
     Config init;
@@ -146,6 +181,15 @@ Config& config() {
         init.host = (::gethostname(hostname, sizeof(hostname) - 1) == 0) ? hostname : "unknown";
       }
       init.enabled = true;
+      // 只在真正启用探针时才注册，未设 KITEX_PROBE_PATH 的普通 Envoy
+      // 不受任何影响（§8.6 的对照组）。
+      //
+      // atexit 而不是 Envoy 的 ServerLifecycleNotifier：探针刻意与 server
+      // 完全解耦（配置走环境变量、不进 bootstrap schema），挂生命周期钩子
+      // 就得让 source/server 反向依赖这个实验性库，rebase 时更难摘除。
+      // 收尾时机上两者等价 —— Envoy 收到 SIGTERM 后是正常返回 main 退出的，
+      // worker 线程在此之前已 join，各自的 ThreadState 析构已经刷过盘了。
+      std::atexit(&reportStatsAtExit);
     }
     return init;
   }();
@@ -201,6 +245,36 @@ void writeOut(ThreadState& st, std::vector<Event>& events) {
   events.clear();
 }
 
+ThreadState::~ThreadState() {
+  writeOut(*this, ready);
+  if (fp != nullptr) {
+    std::fflush(fp);
+    std::fclose(fp);
+    fp = nullptr;
+  }
+}
+
+void reportStatsAtExit() {
+  const Config& cfg = config();
+  if (!cfg.enabled) {
+    return;
+  }
+  const uint64_t recorded = g_recorded.load(std::memory_order_relaxed);
+  const uint64_t written = g_written.load(std::memory_order_relaxed);
+  const uint64_t dropped = g_dropped.load(std::memory_order_relaxed);
+  // 格式与 Kitex 侧 demo/probe 的收尾行保持一致，
+  // `grep "\[probe\]" *.log` 一次覆盖四个节点。
+  //
+  // 完整性判据是「记录==落盘 且 丢弃=0」，不是数行数 ——
+  // 采样率与并发都会让期望行数没法事先算出来。
+  std::fprintf(stderr, "[probe] node=%s host=%s 记录=%llu 落盘=%llu 丢弃=%llu%s\n",
+               cfg.node.c_str(), cfg.host.c_str(), static_cast<unsigned long long>(recorded),
+               static_cast<unsigned long long>(written),
+               static_cast<unsigned long long>(dropped),
+               (recorded == written && dropped == 0) ? "" : "  ← 有数据未落盘");
+  std::fflush(stderr);
+}
+
 // 距上次刷盘超过这个时间就刷一次，即使没攒够 FlushThreshold。
 // 没有它的话，低速率场景（功能验证、低采样率压测）会一直攒在内存里不落盘，
 // 表现为「明明跑通了却没有 trace 文件」。
@@ -234,6 +308,8 @@ void configure(const std::string& path, const std::string& node) {
   c.enabled = !path.empty();
 }
 
+bool enabled() { return config().enabled; }
+
 void connEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono, SystemTime wall) {
   if (!config().enabled) {
     return;
@@ -246,6 +322,27 @@ void connEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono, Sy
     vec.erase(vec.begin());
   }
   vec.push_back(Event{nullptr, point, monoNs(mono), wallNs(wall), 0});
+}
+
+void connSlot(uint64_t conn_id, Slot which, MonotonicTime mono) {
+  if (!config().enabled) {
+    return;
+  }
+  // 这就是整个热路径：一次哈希查找 + 一次 store。不分配、不判采样
+  // （此刻也判不了），未采样请求付的就是这点代价。
+  ConnSlots& s = tls().slots[conn_id];
+  const int64_t m = monoNs(mono);
+  switch (which) {
+  case Slot::DnEpollWake:
+    s.epoll_wake = m;
+    break;
+  case Slot::DnReadvStart:
+    s.readv_start = m;
+    break;
+  case Slot::DnReadvDone:
+    s.readv_done = m;
+    break;
+  }
 }
 
 void bindTrace(uint64_t conn_id, int32_t seq_id, absl::string_view traceparent, MonotonicTime mono,
@@ -266,6 +363,28 @@ void bindTrace(uint64_t conn_id, int32_t seq_id, absl::string_view traceparent, 
     b.sampled = p.sampled;
   }
   st.bindings[conn_id] = b;
+
+  // 采样确认了，才把下游读的三个槽位兑现成事件。
+  //
+  // wall 由基准点推算（与 rpcEvent 同法），不回头读 CLOCK_REALTIME ——
+  // 读路径上本来就只采了 mono，这里也不该为了补 wall 再多一次 vDSO 调用。
+  //
+  // 槽位为 0 表示这一次没记到（响应与请求落在同一次 readv、或连接复用后
+  // 没有新的 epoll 唤醒），跳过即可，**不补零**。
+  if (b.sampled) {
+    auto slot_it = st.slots.find(conn_id);
+    if (slot_it != st.slots.end()) {
+      const ConnSlots& s = slot_it->second;
+      const auto emit = [&](int64_t m, absl::string_view point) {
+        if (m != 0) {
+          push(st, Event{b.trace, point, m, b.base_wall + (m - b.base_mono), seq_id});
+        }
+      };
+      emit(s.epoll_wake, absl::string_view("dn_epoll_wake"));
+      emit(s.readv_start, absl::string_view("dn_readv_start"));
+      emit(s.readv_done, absl::string_view("dn_readv_done"));
+    }
+  }
 
   auto it = st.pending.find(conn_id);
   if (it == st.pending.end()) {
@@ -317,12 +436,16 @@ void endRpc(uint64_t conn_id) {
   auto& st = tls();
   st.bindings.erase(conn_id);
   st.pending.erase(conn_id);
+  // 槽位同样按连接清掉，否则长期运行下这个 map 会随连接数无界增长。
+  // 时序上是安全的：下一个请求的 dn_epoll_wake 写在它自己的 bindTrace 之前，
+  // 而 endRpc 属于上一个请求，两者不会交叠。
+  st.slots.erase(conn_id);
   // 这里**不**落盘。
   //
   // 曾经每次 RPC 结束都 writeOut + fflush，那是为了解决「流量停止后
   // 最后一批事件永远留在内存」的问题 —— 但代价是每个采样请求一次
-  // write 系统调用。收尾问题应该由进程退出时的 flush 解决，
-  // 而不是让稳态路径为它买单（见 registerExitFlush）。
+  // write 系统调用。收尾问题由线程退出时 ~ThreadState() 的刷盘解决，
+  // 稳态路径不必为它买单。
 }
 
 void flush() {
@@ -332,17 +455,6 @@ void flush() {
     std::fflush(st.fp);
   }
 }
-
-namespace {
-// 线程退出时把该线程剩余的事件落盘。
-//
-// 这才是「收尾」的正确位置：稳态路径完全不必为此付出代价，
-// 而进程/线程结束时只做一次。
-struct ThreadFlusher {
-  ~ThreadFlusher() { flush(); }
-};
-thread_local ThreadFlusher g_thread_flusher;
-} // namespace
 
 Stats stats() {
   return Stats{g_recorded.load(std::memory_order_relaxed),

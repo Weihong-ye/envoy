@@ -734,8 +734,16 @@ void ConnectionImpl::onFileEvent(uint32_t events) {
   // 顺带还省了一次 clock_gettime：这个值本来就是缓存好的。
   //
   // 只对读就绪打点：写就绪走 onWriteReady 另一条路径，混进来会污染分解。
+  //
+  // 上下游走两套不同的落点：上游侧此刻采样状态已知（onPoolReady 时查过并挂了标志），
+  // 直接记事件；下游侧 TTHeader 还没解析、trace 与采样都不可知，只能写槽位，
+  // 等 bindTrace 时再决定兑现还是丢弃（见 probe.h 的 connSlot）。
   if (kitex_probe_on_ && (events & Event::FileReadyType::Read)) {
-    KITEX_PROBE_AT(kitex_probe_dn_id_, "up_epoll_wake", dispatcher_.approximateMonotonicTime());
+    if (kitex_probe_upstream_) {
+      KITEX_PROBE_AT(kitex_probe_dn_id_, "up_epoll_wake", dispatcher_.approximateMonotonicTime());
+    } else {
+      KITEX_PROBE_SLOT(kitex_probe_dn_id_, DnEpollWake, dispatcher_.approximateMonotonicTime());
+    }
   }
 
   ScopeTrackerScopeState scope(this, this->dispatcher_);
@@ -825,12 +833,21 @@ void ConnectionImpl::onReadReady() {
   // 对 thrift 小报文 N 通常为 2（一次拿到数据，一次拿到 EAGAIN）。
   // 若实测这段异常大，再往 RawBufferSocket 循环内部钻。
   const bool probe = kitex_probe_on_;
+  const bool probe_up = kitex_probe_upstream_;
   if (probe) {
-    KITEX_PROBE(kitex_probe_dn_id_, "up_readv_start", dispatcher_.timeSource());
+    if (probe_up) {
+      KITEX_PROBE(kitex_probe_dn_id_, "up_readv_start", dispatcher_.timeSource());
+    } else {
+      KITEX_PROBE_SLOT(kitex_probe_dn_id_, DnReadvStart, dispatcher_.timeSource().monotonicTime());
+    }
   }
   IoResult result = transport_socket_->doRead(*read_buffer_);
   if (probe) {
-    KITEX_PROBE(kitex_probe_dn_id_, "up_readv_done", dispatcher_.timeSource());
+    if (probe_up) {
+      KITEX_PROBE(kitex_probe_dn_id_, "up_readv_done", dispatcher_.timeSource());
+    } else {
+      KITEX_PROBE_SLOT(kitex_probe_dn_id_, DnReadvDone, dispatcher_.timeSource().monotonicTime());
+    }
   }
 
   uint64_t new_buffer_size = read_buffer_->length();
@@ -1149,6 +1166,10 @@ ClientConnectionImpl::ClientConnectionImpl(
                      false),
       stream_info_(dispatcher_.timeSource(), socket_->connectionInfoProviderSharedPtr(),
                    StreamInfo::FilterState::LifeSpan::Connection) {
+  // 打点：本连接是「上游」侧。必须在下面几个 early return 之前置位。
+  // 另一个构造函数委托到本构造函数，所以两条路径都被覆盖。
+  kitex_probe_upstream_ = true;
+
   if (!socket_->isOpen()) {
     setFailureReason("socket creation failure");
     // Set up the dispatcher to "close" the connection on the next loop after
