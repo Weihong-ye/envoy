@@ -434,7 +434,16 @@ void endRpc(uint64_t conn_id) {
     return;
   }
   auto& st = tls();
-  st.bindings.erase(conn_id);
+  // **绑定刻意不在这里擦。**
+  //
+  // 下游响应的 writev 是异步的：conn_manager 里 write() 只入队，真正的
+  // writev 由事件循环在 rpc_done **之后**才执行。擦了绑定，那个点就永远
+  // 采不到（实测 dn_writev_* 0 条），下游回写这一侧就没法与下游收包对称。
+  //
+  // 不擦是安全的：绑定由下一个请求的 bindTrace 覆盖，pending 与 slots 照常清，
+  // 所以不会串到下一条 trace 上。这段窗口里能发的 rpcEvent 只有下游 writev
+  // 一种 —— 其余点位都在 RPC 内部。代价是每条连接常驻一份 binding
+  // （连接数量级，不随请求增长）。
   st.pending.erase(conn_id);
   // 槽位同样按连接清掉，否则长期运行下这个 map 会随连接数无界增长。
   // 时序上是安全的：下一个请求的 dn_epoll_wake 写在它自己的 bindTrace 之前，
