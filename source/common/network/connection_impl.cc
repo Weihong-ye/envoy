@@ -942,7 +942,32 @@ void ConnectionImpl::onWriteReady() {
     }
   }
 
+  // 括住真正的 writev。
+  //
+  // **这才是 Envoy 写 socket 的系统调用时间。** `ConnectionImpl::write()` 只做
+  // `write_buffer_->move(data)` + `activateFileEvents`，是入队不是发送；
+  // 而 `up_socket_write_done` 记的正是那个入队点。拿它去和 Go 侧
+  // `mesh_socket_write_*`（同步 Flush，真的执行 sendmsg）相比，
+  // 曾得出「Go 侧写 socket 比 Envoy 贵 7-10 倍」—— 两边量的根本不是一回事。
+  //
+  // 与读路径同构：按 side 选 up_/dn_，未开探针时只多一次读 bool。
+  const bool wprobe = kitex_probe_on_;
+  const bool wprobe_up = kitex_probe_upstream_;
+  if (wprobe) {
+    if (wprobe_up) {
+      KITEX_PROBE(kitex_probe_dn_id_, "up_writev_start", dispatcher_.timeSource());
+    } else {
+      KITEX_PROBE(kitex_probe_dn_id_, "dn_writev_start", dispatcher_.timeSource());
+    }
+  }
   IoResult result = transport_socket_->doWrite(*write_buffer_, write_end_stream_);
+  if (wprobe) {
+    if (wprobe_up) {
+      KITEX_PROBE(kitex_probe_dn_id_, "up_writev_done", dispatcher_.timeSource());
+    } else {
+      KITEX_PROBE(kitex_probe_dn_id_, "dn_writev_done", dispatcher_.timeSource());
+    }
+  }
   ASSERT(!result.end_stream_read_); // The interface guarantees that only read operations set this.
   uint64_t new_buffer_size = write_buffer_->length();
   updateWriteBufferStats(result.bytes_processed_, new_buffer_size);
