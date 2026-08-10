@@ -957,7 +957,7 @@ void ConnectionImpl::onWriteReady() {
     if (wprobe_up) {
       KITEX_PROBE(kitex_probe_dn_id_, "up_writev_start", dispatcher_.timeSource());
     } else {
-      KITEX_PROBE(kitex_probe_dn_id_, "dn_writev_start", dispatcher_.timeSource());
+      KITEX_PROBE_TAIL(kitex_probe_dn_id_, "dn_writev_start", dispatcher_.timeSource(), false);
     }
   }
   IoResult result = transport_socket_->doWrite(*write_buffer_, write_end_stream_);
@@ -965,7 +965,7 @@ void ConnectionImpl::onWriteReady() {
     if (wprobe_up) {
       KITEX_PROBE(kitex_probe_dn_id_, "up_writev_done", dispatcher_.timeSource());
     } else {
-      KITEX_PROBE(kitex_probe_dn_id_, "dn_writev_done", dispatcher_.timeSource());
+      KITEX_PROBE_TAIL(kitex_probe_dn_id_, "dn_writev_done", dispatcher_.timeSource(), true);
     }
   }
   ASSERT(!result.end_stream_read_); // The interface guarantees that only read operations set this.

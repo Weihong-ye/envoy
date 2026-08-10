@@ -81,6 +81,22 @@ void connSlot(uint64_t conn_id, Slot which, MonotonicTime mono);
 void rpcEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono);
 
 /**
+ * 记录**响应写出**这类「RPC 已结束但事件还没发生」的点位。
+ *
+ * 下游 writev 是异步的：conn_manager 里 write() 只入队，真正的 writev 由事件
+ * 循环在 rpc_done 之后才执行。普通 rpcEvent 那时已经查不到绑定了。
+ *
+ * 这里查的是 endRpc 移交过来的 finishing 槽（查不到则回落到 bindings，
+ * 覆盖「事件循环先于 deferred delete」的顺序）。last=true 表示这是该 RPC 的
+ * 最后一个尾部点位，记完即释放 —— 否则 onWriteReady 后续的空写会继续挂在它名下。
+ *
+ * **一条连接同时最多容纳一个待写出的 RPC。** 流水线下前一个会被丢弃并计入
+ * 统计（`[probe]` 行的「下游写未归属」），因为那种情况下一次 writev 可能
+ * 同时写出多个响应，「某个 RPC 的 writev」本就不可拆 —— 宁可丢也不误记。
+ */
+void rpcEventTail(uint64_t conn_id, absl::string_view point, MonotonicTime mono, bool last);
+
+/**
  * 该连接上当前是否有被采样的 RPC。
  *
  * 只供**非热路径**做一次性门控。通用读路径（ConnectionImpl 的 epoll/readv 点位）
@@ -140,6 +156,10 @@ Stats stats();
 
 #define KITEX_PROBE_SAMPLED(conn_id) ::Envoy::KitexProbe::isSampled((conn_id))
 
+// 记录 RPC 尾部（响应已入队、writev 稍后执行）的点位。
+#define KITEX_PROBE_TAIL(conn_id, point, time_source, last)                                        \
+  ::Envoy::KitexProbe::rpcEventTail((conn_id), (point), (time_source).monotonicTime(), (last))
+
 // 记录一个**已经采好**的时刻，而不是「现在」。
 // 用于时刻来自别处的场景，例如 epoll 返回的时间由 libevent 的 check 回调
 // 提前记下（Envoy 的 approximateMonotonicTime），到 onFileEvent 里再补记。
@@ -169,6 +189,9 @@ Stats stats();
   do {                                                                                             \
   } while (0)
 #define KITEX_PROBE_SLOT(conn_id, slot, mono)                                                      \
+  do {                                                                                             \
+  } while (0)
+#define KITEX_PROBE_TAIL(conn_id, point, time_source, last)                                        \
   do {                                                                                             \
   } while (0)
 

@@ -116,6 +116,19 @@ public:
   // 一条连接上同时最多有少量待定事件（通常 1 个），用小 vector 足够。
   absl::flat_hash_map<uint64_t, std::vector<Event>> pending;
   absl::flat_hash_map<uint64_t, Binding> bindings;
+  // 「响应已入队、writev 还没执行」的那个 RPC。
+  //
+  // 下游 writev 是异步的，执行时 RPC 早已 rpc_done。曾经为此干脆不擦 bindings，
+  // 但那在流水线下会出错：请求 N 的 writev 还没跑，N+1 的 bindTrace 就把
+  // bindings[conn] 覆盖了，N 的写会被记到 N+1 头上。
+  //
+  // 改为单独一个槽：endRpc 把 binding 移到这里，bindings 照常擦（isSampled
+  // 等语义不变）。下游 writev 只查这里，写完即清。
+  //
+  // **一条连接同时最多容纳一个「待写出」的 RPC。** 若前一个还没写出就又来一个，
+  // 计入 g_write_lost 并丢弃 —— 宁可丢也不能误记。这也是诚实的：流水线下
+  // 一次 writev 可能同时写出多个响应，「某个 RPC 的 writev」本就不可拆。
+  absl::flat_hash_map<uint64_t, Binding> finishing;
   // 下游读的时间戳槽位，与 pending 一样按下游 conn_id 索引，
   // 同样在 endRpc 里清理，避免随连接数无界增长。
   absl::flat_hash_map<uint64_t, ConnSlots> slots;
@@ -199,6 +212,9 @@ Config& config() {
 std::atomic<uint64_t> g_recorded{0};
 std::atomic<uint64_t> g_written{0};
 std::atomic<uint64_t> g_dropped{0};
+// 下游 writev 无法归属的次数（前一个响应还没写出，新请求就已绑定）。
+// 不为零说明连接上出现了流水线，此时下游写侧的分解不完整。
+std::atomic<uint64_t> g_write_lost{0};
 
 // ready 累积到这个数量就刷盘。
 // 取值权衡：太小则频繁 IO 影响请求路径，太大则进程异常退出时丢失过多。
@@ -267,11 +283,19 @@ void reportStatsAtExit() {
   //
   // 完整性判据是「记录==落盘 且 丢弃=0」，不是数行数 ——
   // 采样率与并发都会让期望行数没法事先算出来。
-  std::fprintf(stderr, "[probe] node=%s host=%s 记录=%llu 落盘=%llu 丢弃=%llu%s\n",
+  const uint64_t wlost = g_write_lost.load(std::memory_order_relaxed);
+  std::fprintf(stderr,
+               "[probe] node=%s host=%s 记录=%llu 落盘=%llu 丢弃=%llu 下游写未归属=%llu%s\n",
                cfg.node.c_str(), cfg.host.c_str(), static_cast<unsigned long long>(recorded),
                static_cast<unsigned long long>(written),
-               static_cast<unsigned long long>(dropped),
+               static_cast<unsigned long long>(dropped), static_cast<unsigned long long>(wlost),
                (recorded == written && dropped == 0) ? "" : "  ← 有数据未落盘");
+  if (wlost > 0) {
+    std::fprintf(stderr,
+                 "[probe] 提示：下游写有 %llu 次无法归属（同一连接上出现流水线）。"
+                 "下游 writev 那两段不完整，其余点位不受影响。\n",
+                 static_cast<unsigned long long>(wlost));
+  }
   std::fflush(stderr);
 }
 
@@ -420,6 +444,32 @@ void rpcEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono) {
   push(st, Event{b.trace, point, m, b.base_wall + (m - b.base_mono), b.seq_id});
 }
 
+void rpcEventTail(uint64_t conn_id, absl::string_view point, MonotonicTime mono, bool last) {
+  if (!config().enabled) {
+    return;
+  }
+  auto& st = tls();
+  // 先查 finishing；若 endRpc 还没跑（事件循环先处理了写），回落到 bindings。
+  auto it = st.finishing.find(conn_id);
+  if (it == st.finishing.end()) {
+    it = st.bindings.find(conn_id);
+    if (it == st.bindings.end()) {
+      return;
+    }
+  }
+  const auto& b = it->second;
+  if (b.trace == nullptr || !b.sampled) {
+    return;
+  }
+  const int64_t m = monoNs(mono);
+  push(st, Event{b.trace, point, m, b.base_wall + (m - b.base_mono), b.seq_id});
+  if (last) {
+    // 响应已真正写出，这条 trace 的尾巴到此为止。清掉，避免后续的空写
+    // （onWriteReady 会重复触发）继续挂在它名下。
+    st.finishing.erase(conn_id);
+  }
+}
+
 bool isSampled(uint64_t conn_id) {
   if (!config().enabled) {
     return false;
@@ -434,16 +484,19 @@ void endRpc(uint64_t conn_id) {
     return;
   }
   auto& st = tls();
-  // **绑定刻意不在这里擦。**
-  //
-  // 下游响应的 writev 是异步的：conn_manager 里 write() 只入队，真正的
-  // writev 由事件循环在 rpc_done **之后**才执行。擦了绑定，那个点就永远
-  // 采不到（实测 dn_writev_* 0 条），下游回写这一侧就没法与下游收包对称。
-  //
-  // 不擦是安全的：绑定由下一个请求的 bindTrace 覆盖，pending 与 slots 照常清，
-  // 所以不会串到下一条 trace 上。这段窗口里能发的 rpcEvent 只有下游 writev
-  // 一种 —— 其余点位都在 RPC 内部。代价是每条连接常驻一份 binding
-  // （连接数量级，不随请求增长）。
+  // 把绑定移交给 finishing —— 下游响应的 writev 要到事件循环稍后才执行，
+  // 那时 RPC 已经结束，但事件仍属于它。详见 ThreadState::finishing 的注释。
+  auto it = st.bindings.find(conn_id);
+  if (it != st.bindings.end()) {
+    auto prev = st.finishing.find(conn_id);
+    if (prev != st.finishing.end() && prev->second.trace != nullptr) {
+      // 上一个响应还没写出就又结束了一个 —— 流水线。丢弃旧的并计数，
+      // 不去猜哪次 writev 属于谁。
+      g_write_lost.fetch_add(1, std::memory_order_relaxed);
+    }
+    st.finishing[conn_id] = it->second;
+    st.bindings.erase(conn_id);
+  }
   st.pending.erase(conn_id);
   // 槽位同样按连接清掉，否则长期运行下这个 map 会随连接数无界增长。
   // 时序上是安全的：下一个请求的 dn_epoll_wake 写在它自己的 bindTrace 之前，
