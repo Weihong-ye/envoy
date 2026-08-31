@@ -140,8 +140,24 @@ IoHandlePtr SocketInterfaceImpl::socket(Socket::Type socket_type,
     v6only = addr->ip()->ipv6()->v6only();
   }
 
-  IoHandlePtr io_handle =
-      SocketInterfaceImpl::socket(socket_type, addr->type(), ip_version, v6only, options);
+  const bool use_smc = socket_type == Socket::Type::Stream && addr->type() == Address::Type::Ip &&
+                       ip_version == Address::IpVersion::v4 &&
+                       (addr->ip()->addressAsString() == "141.61.17.202" ||
+                        addr->ip()->addressAsString() == "141.61.17.204" ||
+                        addr->ip()->addressAsString() == "141.61.17.206" ||
+                        addr->ip()->addressAsString() == "141.61.17.208");
+
+  IoHandlePtr io_handle;
+  if (use_smc) {
+    const Api::SysCallSocketResult result =
+        Api::OsSysCallsSingleton::get().socket(AF_SMC, SOCK_NONBLOCK | SOCK_STREAM, 0);
+    RELEASE_ASSERT(SOCKET_VALID(result.return_value_),
+                   fmt::format("socket(AF_SMC) failed: {}", errorDetails(result.errno_)));
+    // Keep the baseline IoSocketHandleImpl; LD_PRELOAD handles the copy APIs.
+    io_handle = makeSocket(result.return_value_, v6only, socket_type, AF_SMC, options);
+  } else {
+    io_handle = SocketInterfaceImpl::socket(socket_type, addr->type(), ip_version, v6only, options);
+  }
   if (io_handle && addr->type() == Address::Type::Ip && ip_version == Address::IpVersion::v6 &&
       !Address::forceV6()) {
     // Setting IPV6_V6ONLY restricts the IPv6 socket to IPv6 connections only.

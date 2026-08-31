@@ -61,6 +61,12 @@ StatusOr<Address::InstanceConstSharedPtr> addressFromSockAddr(const sockaddr_sto
     v6only = false;
   }
   switch (ss.ss_family) {
+  case AF_SMC: {
+    RELEASE_ASSERT(ss_len == 0 || static_cast<unsigned int>(ss_len) == sizeof(sockaddr_in), "");
+    const struct sockaddr_in* sin = reinterpret_cast<const struct sockaddr_in*>(&ss);
+    ASSERT(AF_SMC == sin->sin_family);
+    return Address::InstanceFactory::createInstancePtr<Address::Ipv4Instance>(sin);
+  }
   case AF_INET: {
     RELEASE_ASSERT(ss_len == 0 || static_cast<unsigned int>(ss_len) == sizeof(sockaddr_in), "");
     const struct sockaddr_in* sin = reinterpret_cast<const struct sockaddr_in*>(&ss);
