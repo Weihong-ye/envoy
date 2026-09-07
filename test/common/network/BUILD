@@ -438,6 +438,16 @@ envoy_cc_test(
     ],
 )
 
+envoy_cc_test(
+    name = "ub_copy_address_selector_test",
+    srcs = ["ub_copy_address_selector_test.cc"],
+    deps = [
+        "//source/common/network:ip_address_parsing_lib",
+        "//source/common/network:ub_copy_address_selector_lib",
+        "//test/test_common:status_utility_lib",
+    ],
+)
+
 envoy_cc_fuzz_test(
     name = "udp_fuzz_test",
     srcs = ["udp_fuzz.cc"],

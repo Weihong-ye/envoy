@@ -9,6 +9,7 @@
 #include "source/common/common/utility.h"
 #include "source/common/network/address_impl.h"
 #include "source/common/network/io_socket_handle_impl.h"
+#include "source/common/network/ub_copy_address_selector.h"
 #include "source/common/network/win32_socket_handle_impl.h"
 
 #if defined(__linux__) && !defined(__ANDROID_API__) && defined(ENVOY_ENABLE_IO_URING)
@@ -142,10 +143,7 @@ IoHandlePtr SocketInterfaceImpl::socket(Socket::Type socket_type,
 
   const bool use_smc = socket_type == Socket::Type::Stream && addr->type() == Address::Type::Ip &&
                        ip_version == Address::IpVersion::v4 &&
-                       (addr->ip()->addressAsString() == "141.61.17.202" ||
-                        addr->ip()->addressAsString() == "141.61.17.204" ||
-                        addr->ip()->addressAsString() == "141.61.17.206" ||
-                        addr->ip()->addressAsString() == "141.61.17.208");
+                       isConfiguredUbCopyIpv4Address(addr->ip()->ipv4()->address());
 
   IoHandlePtr io_handle;
   if (use_smc) {

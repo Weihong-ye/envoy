@@ -17,13 +17,13 @@
 #include "source/common/common/empty_string.h"
 #include "source/common/common/enum_to_int.h"
 #include "source/common/common/scope_tracker.h"
+#include "source/common/kitex_probe/probe.h"
 #include "source/common/network/address_impl.h"
 #include "source/common/network/connection_socket_impl.h"
 #include "source/common/network/raw_buffer_socket.h"
 #include "source/common/network/socket_option_factory.h"
 #include "source/common/network/socket_option_impl.h"
 #include "source/common/network/utility.h"
-#include "source/common/kitex_probe/probe.h"
 #include "source/common/runtime/runtime_features.h"
 
 namespace Envoy {
@@ -841,7 +841,15 @@ void ConnectionImpl::onReadReady() {
       KITEX_PROBE_SLOT(kitex_probe_dn_id_, DnReadvStart, dispatcher_.timeSource().monotonicTime());
     }
   }
+  std::optional<KitexProbe::ScopedIoDetail> io_detail;
+  if (probe) {
+    io_detail.emplace(kitex_probe_dn_id_,
+                      probe_up ? KitexProbe::IoDetailKind::UpstreamRead
+                               : KitexProbe::IoDetailKind::DownstreamRead,
+                      dispatcher_.timeSource());
+  }
   IoResult result = transport_socket_->doRead(*read_buffer_);
+  io_detail.reset();
   if (probe) {
     if (probe_up) {
       KITEX_PROBE(kitex_probe_dn_id_, "up_readv_done", dispatcher_.timeSource());
@@ -960,7 +968,15 @@ void ConnectionImpl::onWriteReady() {
       KITEX_PROBE_TAIL(kitex_probe_dn_id_, "dn_writev_start", dispatcher_.timeSource(), false);
     }
   }
+  std::optional<KitexProbe::ScopedIoDetail> io_detail;
+  if (wprobe) {
+    io_detail.emplace(kitex_probe_dn_id_,
+                      wprobe_up ? KitexProbe::IoDetailKind::UpstreamWrite
+                                : KitexProbe::IoDetailKind::DownstreamWrite,
+                      dispatcher_.timeSource());
+  }
   IoResult result = transport_socket_->doWrite(*write_buffer_, write_end_stream_);
+  io_detail.reset();
   if (wprobe) {
     if (wprobe_up) {
       KITEX_PROBE(kitex_probe_dn_id_, "up_writev_done", dispatcher_.timeSource());

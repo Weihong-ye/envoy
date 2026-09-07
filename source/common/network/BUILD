@@ -254,6 +254,20 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "ub_copy_address_selector_lib",
+    srcs = ["ub_copy_address_selector.cc"],
+    hdrs = ["ub_copy_address_selector.h"],
+    deps = [
+        ":ip_address_parsing_lib",
+        "//source/common/common:assert_lib",
+        "//source/common/common:statusor_lib",
+        "@abseil-cpp//absl/container:flat_hash_set",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings",
+    ],
+)
+
+envoy_cc_library(
     name = "default_socket_interface_lib",
     srcs = [
         "io_socket_handle_base_impl.cc",
@@ -288,12 +302,14 @@ envoy_cc_library(
         ":io_socket_error_lib",
         ":socket_interface_lib",
         ":socket_lib",
+        ":ub_copy_address_selector_lib",
         "//envoy/common/io:io_uring_interface",
         "//envoy/event:dispatcher_interface",
         "//envoy/network:io_handle_interface",
         "//source/common/api:os_sys_calls_lib",
         "//source/common/buffer:buffer_lib",
         "//source/common/event:dispatcher_includes",
+        "//source/common/kitex_probe:kitex_probe_lib",
         "@envoy_api//envoy/extensions/network/socket_interface/v3:pkg_cc_proto",
         "@quiche//:quic_platform_socket_address",
     ] + select({
