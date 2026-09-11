@@ -251,7 +251,10 @@ public:
 
     return *this;
   }
-  Buffer::OwnedImpl& buffer() override { return upstream_request_buffer_; }
+  Buffer::OwnedImpl& buffer() override {
+    ASSERT(upstream_request_buffer_ != nullptr);
+    return *upstream_request_buffer_;
+  }
   Event::Dispatcher& dispatcher() override { return callbacks_->dispatcher(); }
   uint64_t downstreamConnectionId() const override {
     return callbacks_ != nullptr && callbacks_->connection() != nullptr
@@ -332,7 +335,7 @@ private:
   Envoy::Router::MetadataMatchCriteriaConstPtr metadata_match_criteria_;
 
   std::unique_ptr<UpstreamRequest> upstream_request_;
-  Buffer::OwnedImpl upstream_request_buffer_;
+  std::unique_ptr<Buffer::OwnedImpl> upstream_request_buffer_;
 
   bool passthrough_supported_ : 1 = false;
   uint64_t request_size_{};

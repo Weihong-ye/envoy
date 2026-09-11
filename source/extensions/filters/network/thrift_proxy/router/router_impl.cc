@@ -9,6 +9,9 @@
 #include "envoy/upstream/thread_local_cluster.h"
 
 #include "source/common/common/utility.h"
+#if defined(__linux__)
+#include "source/common/network/ub_socket_handle_impl.h"
+#endif
 #include "source/common/router/metadatamatchcriteria_impl.h"
 #include "source/extensions/filters/network/thrift_proxy/app_exception_impl.h"
 
@@ -261,6 +264,18 @@ void Router::onDestroy() {
 void Router::setDecoderFilterCallbacks(ThriftFilters::DecoderFilterCallbacks& callbacks) {
   callbacks_ = &callbacks;
   upstream_response_callbacks_ = std::make_unique<UpstreamResponseCallbacksImpl>(callbacks_);
+#if defined(__linux__)
+  // In the supported sidecar topology a UB-backed UDS downstream is paired with a UBSocket
+  // upstream. The opposite side receives from UBSocket and sends to Kitex over UDS, so its newly
+  // encoded request must remain heap-backed.
+  const bool ub_destination = callbacks.connection() != nullptr &&
+                              Network::Ubsocket::connectionUsesUbUdsRead(*callbacks.connection());
+  upstream_request_buffer_ =
+      std::make_unique<Buffer::OwnedImpl>(
+          Network::Ubsocket::createOutputSliceFactory(ub_destination));
+#else
+  upstream_request_buffer_ = std::make_unique<Buffer::OwnedImpl>();
+#endif
 
   // TODO(zuercher): handle buffer limits
 }
@@ -345,7 +360,7 @@ FilterStatus Router::messageBegin(MessageMetadataSharedPtr metadata) {
 
 FilterStatus Router::messageEnd() {
   ProtocolConverter::messageEnd();
-  const auto encode_size = upstream_request_->encodeAndWrite(upstream_request_buffer_);
+  const auto encode_size = upstream_request_->encodeAndWrite(*upstream_request_buffer_);
   // E6 请求已编码并写往上游
   if (callbacks_->connection() != nullptr) {
     KITEX_PROBE(callbacks_->connection()->id(), "up_write_done",

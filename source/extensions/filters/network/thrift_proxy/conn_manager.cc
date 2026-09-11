@@ -2,6 +2,9 @@
 
 #include "source/common/common/macros.h"
 #include "source/common/kitex_probe/probe.h"
+#if defined(__linux__)
+#include "source/common/network/ub_socket_handle_impl.h"
+#endif
 
 #include "envoy/common/exception.h"
 #include "envoy/event/dispatcher.h"
@@ -300,7 +303,12 @@ void ConnectionManager::ResponseDecoder::finalizeResponse() {
     throw EnvoyException("downstream connection is closed");
   }
 
+#if defined(__linux__)
+  Buffer::OwnedImpl buffer(Network::Ubsocket::createOutputSliceFactory(
+      Network::Ubsocket::connectionUsesUbTransport(cm.read_callbacks_->connection())));
+#else
   Buffer::OwnedImpl buffer;
+#endif
 
   // Use the factory to get the concrete transport from the decoder transport (as opposed to
   // potentially pre-detection auto transport).

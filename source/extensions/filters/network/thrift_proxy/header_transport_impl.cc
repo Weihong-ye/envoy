@@ -201,7 +201,9 @@ void HeaderTransportImpl::encodeFrame(Buffer::Instance& buffer, const MessageMet
         absl::StrCat("invalid thrift header transport too many headers ", headers_size));
   }
 
-  Buffer::OwnedImpl header_buffer;
+  const auto* owned_output = dynamic_cast<const Buffer::OwnedImpl*>(&buffer);
+  Buffer::OwnedImpl header_buffer(owned_output != nullptr ? owned_output->sliceFactory()
+                                                          : Buffer::OwnedImpl::SliceFactory{});
 
   if (!metadata.hasProtocol()) {
     throw EnvoyException("missing header transport protocol");

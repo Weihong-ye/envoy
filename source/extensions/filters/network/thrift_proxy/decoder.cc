@@ -5,6 +5,9 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/assert.h"
 #include "source/common/common/macros.h"
+#if defined(__linux__)
+#include "source/common/network/ub_socket_handle_impl.h"
+#endif
 #include "source/extensions/filters/network/thrift_proxy/app_exception_impl.h"
 #include "source/extensions/filters/network/thrift_proxy/thrift.h"
 
@@ -20,7 +23,11 @@ DecoderStateMachine::DecoderStatus DecoderStateMachine::passthroughData(Buffer::
     return {ProtocolState::WaitForData};
   }
 
+#if defined(__linux__)
+  Buffer::OwnedImpl body(Network::Ubsocket::createOutputSliceFactory());
+#else
   Buffer::OwnedImpl body;
+#endif
   body.move(buffer, body_bytes_);
 
   return {ProtocolState::MessageEnd, handler_.passthroughData(body)};

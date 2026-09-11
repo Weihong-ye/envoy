@@ -37,11 +37,37 @@ MessageMetadataSharedPtr mkMessageMetadata(uint32_t num_headers) {
   return metadata;
 }
 
+Buffer::OwnedImpl::SliceFactory externalSliceFactory(uint64_t& allocations) {
+  return
+      [&allocations](uint64_t, uint32_t, void* context, Buffer::OwnedImpl::SliceConsumer consume) {
+        constexpr uint64_t Capacity = 1024 * 1024;
+        ++allocations;
+        auto* storage = new uint8_t[Capacity];
+        consume(context, Buffer::Slice(storage, Capacity, [storage]() { delete[] storage; }));
+      };
+}
+
 } // namespace
 
 TEST(HeaderTransportTest, Name) {
   HeaderTransportImpl transport;
   EXPECT_EQ(transport.name(), "header");
+}
+
+TEST(HeaderTransportTest, EncodeFramePropagatesOutputSliceFactoryToHeader) {
+  HeaderTransportImpl transport;
+  MessageMetadata metadata(true);
+  metadata.setProtocol(ProtocolType::Binary);
+  metadata.setSequenceId(1);
+  Buffer::OwnedImpl message("payload");
+  uint64_t allocations = 0;
+  Buffer::OwnedImpl output(externalSliceFactory(allocations));
+
+  transport.encodeFrame(output, metadata, message);
+
+  // One external slice is allocated for the fixed frame prefix and one for the encoded header.
+  EXPECT_EQ(2, allocations);
+  EXPECT_EQ(0, message.length());
 }
 
 TEST(HeaderTransportTest, NotEnoughData) {

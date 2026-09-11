@@ -63,32 +63,32 @@ const std::string& TTHeaderTransportImpl::aclTokenKey() {
 TTHeaderIntKeyNameValues::TTHeaderIntKeyNameValues() {
   // 顺序必须与 metakey.go 的 iota 严格一致。
   by_id_ = {
-      &MeshVersion,      // 0
-      &TransportType,    // 1
-      &LogId,            // 2
-      &FromService,      // 3
-      &FromCluster,      // 4
-      &FromIdc,          // 5
-      &ToService,        // 6
-      &ToCluster,        // 7
-      &ToIdc,            // 8
-      &ToMethod,         // 9
-      &Env,              // 10
-      &DestAddress,      // 11
-      &RpcTimeout,       // 12
-      &ReadTimeout,      // 13
-      &RingHashKey,      // 14
-      &DdpTag,           // 15
-      &WithMeshHeader,   // 16
-      &ConnectTimeout,   // 17
-      &SpanContext,      // 18
-      &ShortConnection,  // 19
-      &FromMethod,       // 20
-      &StressTag,        // 21
-      &MsgType,          // 22
-      &HttpContentType,  // 23
-      &RawRingHashKey,   // 24
-      &LbType,           // 25
+      &MeshVersion,     // 0
+      &TransportType,   // 1
+      &LogId,           // 2
+      &FromService,     // 3
+      &FromCluster,     // 4
+      &FromIdc,         // 5
+      &ToService,       // 6
+      &ToCluster,       // 7
+      &ToIdc,           // 8
+      &ToMethod,        // 9
+      &Env,             // 10
+      &DestAddress,     // 11
+      &RpcTimeout,      // 12
+      &ReadTimeout,     // 13
+      &RingHashKey,     // 14
+      &DdpTag,          // 15
+      &WithMeshHeader,  // 16
+      &ConnectTimeout,  // 17
+      &SpanContext,     // 18
+      &ShortConnection, // 19
+      &FromMethod,      // 20
+      &StressTag,       // 21
+      &MsgType,         // 22
+      &HttpContentType, // 23
+      &RawRingHashKey,  // 24
+      &LbType,          // 25
   };
 }
 
@@ -133,8 +133,8 @@ std::string TTHeaderTransportImpl::drainString16(Buffer::Instance& buffer, int32
     return {};
   }
   if (remaining < static_cast<int32_t>(len)) {
-    throw EnvoyException(
-        fmt::format("ttheader: header too small reading {} (need {}, have {})", what, len, remaining));
+    throw EnvoyException(fmt::format("ttheader: header too small reading {} (need {}, have {})",
+                                     what, len, remaining));
   }
   const std::string value(static_cast<char*>(buffer.linearize(len)), len);
   buffer.drain(len);
@@ -175,12 +175,12 @@ bool TTHeaderTransportImpl::decodeFrameStart(Buffer::Instance& buffer, MessageMe
   const uint16_t raw_header_size = buffer.peekBEInt<uint16_t>(12);
   const int32_t header_size = static_cast<int32_t>(raw_header_size) * 4;
   if (header_size < MinHeaderInfoSize || header_size > MaxHeadersSize) {
-    throw EnvoyException(fmt::format("ttheader: invalid header size {} ({:04x})", header_size,
-                                     raw_header_size));
+    throw EnvoyException(
+        fmt::format("ttheader: invalid header size {} ({:04x})", header_size, raw_header_size));
   }
   if (header_size > frame_size - static_cast<int32_t>(MetaSizeNoLength)) {
-    throw EnvoyException(fmt::format("ttheader: header size {} exceeds frame size {}", header_size,
-                                     frame_size));
+    throw EnvoyException(
+        fmt::format("ttheader: header size {} exceeds frame size {}", header_size, frame_size));
   }
 
   if (buffer.length() < static_cast<uint64_t>(header_size) + MinDecodeBytes) {
@@ -393,7 +393,9 @@ void TTHeaderTransportImpl::encodeFrame(Buffer::Instance& buffer, const MessageM
     metadata.responseHeaders().iterate(classify);
   }
 
-  Buffer::OwnedImpl header_buffer;
+  const auto* owned_output = dynamic_cast<const Buffer::OwnedImpl*>(&buffer);
+  Buffer::OwnedImpl header_buffer(owned_output != nullptr ? owned_output->sliceFactory()
+                                                          : Buffer::OwnedImpl::SliceFactory{});
 
   // PROTOCOL ID
   switch (metadata.protocol()) {

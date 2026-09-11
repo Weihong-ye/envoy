@@ -38,23 +38,21 @@ namespace {
 //   总长 = 14(meta) + 12(header info) + 5(payload) = 31
 //   LENGTH 字段 = 31 - 4 = 27 = 0x1B
 constexpr uint8_t kKitexBasicFrame[] = {
-    0x00, 0x00, 0x00, 0x1B,             // LENGTH = 27
-    0x10, 0x00,                         // MAGIC = 0x1000
-    0x00, 0x00,                         // FLAGS = 0
-    0x00, 0x00, 0x00, 0x01,             // SEQ ID = 1
-    0x00, 0x03,                         // HEADER SIZE = 3 (*4 = 12)
-    0x00,                               // PROTOCOL ID = ThriftBinary
-    0x00,                               // NUM TRANSFORMS = 0
-    0x10,                               // INFO ID = IntKeyValue
-    0x00, 0x01,                         // count = 1
-    0x00, 0x06,                         // key = 6 (ToService)
-    0x00, 0x03, 0x73, 0x76, 0x63,       // "svc"
-    0x01, 0x02, 0x03, 0x04, 0x05,       // payload
+    0x00, 0x00, 0x00, 0x1B,       // LENGTH = 27
+    0x10, 0x00,                   // MAGIC = 0x1000
+    0x00, 0x00,                   // FLAGS = 0
+    0x00, 0x00, 0x00, 0x01,       // SEQ ID = 1
+    0x00, 0x03,                   // HEADER SIZE = 3 (*4 = 12)
+    0x00,                         // PROTOCOL ID = ThriftBinary
+    0x00,                         // NUM TRANSFORMS = 0
+    0x10,                         // INFO ID = IntKeyValue
+    0x00, 0x01,                   // count = 1
+    0x00, 0x06,                   // key = 6 (ToService)
+    0x00, 0x03, 0x73, 0x76, 0x63, // "svc"
+    0x01, 0x02, 0x03, 0x04, 0x05, // payload
 };
 
-void addBytes(Buffer::Instance& buffer, const uint8_t* data, size_t len) {
-  buffer.add(data, len);
-}
+void addBytes(Buffer::Instance& buffer, const uint8_t* data, size_t len) { buffer.add(data, len); }
 
 std::string hexOf(const Buffer::Instance& buffer) {
   std::string out;
@@ -65,6 +63,16 @@ std::string hexOf(const Buffer::Instance& buffer) {
     out += fmt::format("{:02x}", b);
   }
   return out;
+}
+
+Buffer::OwnedImpl::SliceFactory externalSliceFactory(uint64_t& allocations) {
+  return
+      [&allocations](uint64_t, uint32_t, void* context, Buffer::OwnedImpl::SliceConsumer consume) {
+        constexpr uint64_t Capacity = 1024 * 1024;
+        ++allocations;
+        auto* storage = new uint8_t[Capacity];
+        consume(context, Buffer::Slice(storage, Capacity, [storage]() { delete[] storage; }));
+      };
 }
 
 class TTHeaderTransportTest : public testing::Test {
@@ -98,6 +106,21 @@ TEST_F(TTHeaderTransportTest, DecodesAuthenticKitexFrame) {
 
   // header 之后 buffer 里应只剩 payload
   EXPECT_EQ(5, buffer.length());
+}
+
+TEST_F(TTHeaderTransportTest, EncodeFramePropagatesOutputSliceFactoryToHeader) {
+  MessageMetadata metadata(true);
+  metadata.setProtocol(ProtocolType::Binary);
+  metadata.setSequenceId(1);
+  Buffer::OwnedImpl message("payload");
+  uint64_t allocations = 0;
+  Buffer::OwnedImpl output(externalSliceFactory(allocations));
+
+  transport_.encodeFrame(output, metadata, message);
+
+  // One external slice is allocated for the fixed frame prefix and one for the encoded header.
+  EXPECT_EQ(2, allocations);
+  EXPECT_EQ(0, message.length());
 }
 
 TEST_F(TTHeaderTransportTest, RejectsApacheTHeaderMagic) {
@@ -141,12 +164,12 @@ TEST_P(TTHeaderProtocolIdTest, ProtocolIdWhitelist) {
 }
 
 INSTANTIATE_TEST_SUITE_P(ProtocolIds, TTHeaderProtocolIdTest,
-                         testing::Values(std::make_tuple(0x00, true),  // ThriftBinary
-                                         std::make_tuple(0x02, true),  // ThriftCompact
-                                         std::make_tuple(0x03, false), // ThriftCompactV2
-                                         std::make_tuple(0x04, false), // KitexProtobuf
-                                         std::make_tuple(0x10, false), // streaming
-                                         std::make_tuple(0x11, false), // streaming
+                         testing::Values(std::make_tuple(0x00, true),    // ThriftBinary
+                                         std::make_tuple(0x02, true),    // ThriftCompact
+                                         std::make_tuple(0x03, false),   // ThriftCompactV2
+                                         std::make_tuple(0x04, false),   // KitexProtobuf
+                                         std::make_tuple(0x10, false),   // streaming
+                                         std::make_tuple(0x11, false),   // streaming
                                          std::make_tuple(0x7F, false))); // 未定义
 
 TEST_F(TTHeaderTransportTest, RejectsTransforms) {
@@ -348,9 +371,9 @@ TEST_P(TTHeaderFixtureTest, MatchesKitexEncoder) {
   for (const auto& [id, value] : f.int_info) {
     const auto* name = TTHeaderIntKeyNames::get().fromId(id);
     Http::LowerCaseString key =
-        name != nullptr ? *name
-                        : Http::LowerCaseString(absl::StrCat(
-                              TTHeaderTransportImpl::UnknownIntKeyPrefix, id));
+        name != nullptr
+            ? *name
+            : Http::LowerCaseString(absl::StrCat(TTHeaderTransportImpl::UnknownIntKeyPrefix, id));
     const auto res = metadata.requestHeaders().get(key);
     ASSERT_FALSE(res.empty()) << "缺少 IntKV id=" << id << " (" << key.get() << ")";
     EXPECT_EQ(value, res[0]->value().getStringView()) << "IntKV id=" << id;
@@ -431,12 +454,11 @@ TEST(TTHeaderMetainfoCaseTest, CaseIsLostWithoutPreserveKeys) {
          "§9.1 的结论和 header_keys_preserve_case 的必要性需要重新评估";
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    KitexFixtures, TTHeaderFixtureTest,
-    testing::Range(size_t{0}, TTHeaderFixtures::all().size()),
-    [](const testing::TestParamInfo<size_t>& info) {
-      return std::string(TTHeaderFixtures::all()[info.param].name);
-    });
+INSTANTIATE_TEST_SUITE_P(KitexFixtures, TTHeaderFixtureTest,
+                         testing::Range(size_t{0}, TTHeaderFixtures::all().size()),
+                         [](const testing::TestParamInfo<size_t>& info) {
+                           return std::string(TTHeaderFixtures::all()[info.param].name);
+                         });
 
 // ---------------------------------------------------------------------------
 // TTHeaderFramed:载荷前的内层 4 字节长度前缀
@@ -519,9 +541,7 @@ TEST_F(TTHeaderTransportTest, LeavesUnframedPayloadAlone) {
   MessageMetadata metadata(true, /*preserve_keys=*/true);
   ASSERT_TRUE(transport_.decodeFrameStart(buffer, metadata));
   EXPECT_EQ(5, metadata.frameSize()) << "无内层前缀时 frameSize 不应被改动";
-  EXPECT_TRUE(metadata.requestHeaders()
-                  .get(TTHeaderTransportImpl::framedPayloadMarker())
-                  .empty())
+  EXPECT_TRUE(metadata.requestHeaders().get(TTHeaderTransportImpl::framedPayloadMarker()).empty())
       << "无内层前缀时不应打标记";
 }
 
