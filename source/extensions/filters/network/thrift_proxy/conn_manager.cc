@@ -18,6 +18,8 @@ namespace Extensions {
 namespace NetworkFilters {
 namespace ThriftProxy {
 
+constexpr uint64_t LargePayloadProbeThresholdBytes = 4 * 1024;
+
 ConnectionManager::ConnectionManager(const ConfigSharedPtr& config,
                                      Random::RandomGenerator& random_generator,
                                      TimeSource& time_source,
@@ -271,7 +273,11 @@ bool ConnectionManager::ResponseDecoder::onData(Buffer::Instance& data) {
 }
 
 FilterStatus ConnectionManager::ResponseDecoder::transportBegin(MessageMetadataSharedPtr metadata) {
-  return parent_.applyEncoderFilters(DecoderEvent::TransportBegin, metadata, protocol_converter_);
+  const FilterStatus status =
+      parent_.applyEncoderFilters(DecoderEvent::TransportBegin, metadata, protocol_converter_);
+  KITEX_PROBE_IF_SAMPLED(parent_.parent_.read_callbacks_->connection().id(),
+                         "resp_transport_begin_done", parent_.parent_.time_source_);
+  return status;
 }
 
 FilterStatus ConnectionManager::ResponseDecoder::transportEnd() {
@@ -316,6 +322,8 @@ void ConnectionManager::ResponseDecoder::finalizeResponse() {
       NamedTransportConfigFactory::getFactory(cm.decoder_->transportType()).createTransport();
 
   metadata_->setProtocol(cm.decoder_->protocolType());
+  KITEX_PROBE_IF_SAMPLED(cm.read_callbacks_->connection().id(), "dn_frame_encode_start",
+                         parent_.parent_.time_source_);
   transport->encodeFrame(buffer, *metadata_, parent_.response_buffer_);
   // 下游响应帧编码完成。与上游侧的 up_encode_done 对称，把「编码」与「写 socket」
   // 分开 —— 合在一起的话分不清是序列化慢还是 socket 慢。
@@ -360,7 +368,19 @@ void ConnectionManager::ResponseDecoder::finalizeResponse() {
 FilterStatus ConnectionManager::ResponseDecoder::passthroughData(Buffer::Instance& data) {
   passthrough_ = true;
 
-  return parent_.applyEncoderFilters(DecoderEvent::PassthroughData, &data, protocol_converter_);
+  if (!body_mode_recorded_) {
+    body_mode_recorded_ = true;
+    KITEX_PROBE_IF_SAMPLED(parent_.parent_.read_callbacks_->connection().id(),
+                           "resp_body_passthrough", parent_.parent_.time_source_);
+  }
+
+  const uint64_t connection_id = parent_.parent_.read_callbacks_->connection().id();
+  KITEX_PROBE_IF_SAMPLED(connection_id, "resp_passthrough_move_start",
+                         parent_.parent_.time_source_);
+  const FilterStatus status =
+      parent_.applyEncoderFilters(DecoderEvent::PassthroughData, &data, protocol_converter_);
+  KITEX_PROBE_IF_SAMPLED(connection_id, "resp_passthrough_move_done", parent_.parent_.time_source_);
+  return status;
 }
 
 FilterStatus ConnectionManager::ResponseDecoder::messageBegin(MessageMetadataSharedPtr metadata) {
@@ -406,15 +426,27 @@ FilterStatus ConnectionManager::ResponseDecoder::messageBegin(MessageMetadataSha
 
   parent_.recordResponseAccessLog(metadata);
 
-  return parent_.applyEncoderFilters(DecoderEvent::MessageBegin, metadata, protocol_converter_);
+  const FilterStatus status =
+      parent_.applyEncoderFilters(DecoderEvent::MessageBegin, metadata, protocol_converter_);
+  KITEX_PROBE_IF_SAMPLED(parent_.parent_.read_callbacks_->connection().id(),
+                         "resp_message_begin_done", parent_.parent_.time_source_);
+  return status;
 }
 
 FilterStatus ConnectionManager::ResponseDecoder::messageEnd() {
-  return parent_.applyEncoderFilters(DecoderEvent::MessageEnd, absl::monostate(),
-                                     protocol_converter_);
+  const FilterStatus status =
+      parent_.applyEncoderFilters(DecoderEvent::MessageEnd, absl::monostate(), protocol_converter_);
+  KITEX_PROBE_IF_SAMPLED(parent_.parent_.read_callbacks_->connection().id(),
+                         "resp_message_end_done", parent_.parent_.time_source_);
+  return status;
 }
 
 FilterStatus ConnectionManager::ResponseDecoder::structBegin(absl::string_view name) {
+  if (!body_mode_recorded_) {
+    body_mode_recorded_ = true;
+    KITEX_PROBE_IF_SAMPLED(parent_.parent_.read_callbacks_->connection().id(),
+                           "resp_body_full_decode", parent_.parent_.time_source_);
+  }
   return parent_.applyEncoderFilters(DecoderEvent::StructBegin, std::string(name),
                                      protocol_converter_);
 }
@@ -427,9 +459,16 @@ FilterStatus ConnectionManager::ResponseDecoder::structEnd() {
 FilterStatus ConnectionManager::ResponseDecoder::fieldBegin(absl::string_view name,
                                                             FieldType& field_type,
                                                             int16_t& field_id) {
-  return parent_.applyEncoderFilters(DecoderEvent::FieldBegin,
-                                     std::make_tuple(std::string(name), field_type, field_id),
-                                     protocol_converter_);
+  const FilterStatus status = parent_.applyEncoderFilters(
+      DecoderEvent::FieldBegin, std::make_tuple(std::string(name), field_type, field_id),
+      protocol_converter_);
+  if (!payload_probe_recorded_ && field_type == FieldType::String) {
+    const uint64_t connection_id = parent_.parent_.read_callbacks_->connection().id();
+    if (KITEX_PROBE_SAMPLED(connection_id)) {
+      payload_probe_candidate_ = parent_.parent_.time_source_.monotonicTime();
+    }
+  }
+  return status;
 }
 
 FilterStatus ConnectionManager::ResponseDecoder::fieldEnd() {
@@ -462,8 +501,23 @@ FilterStatus ConnectionManager::ResponseDecoder::doubleValue(double& value) {
 }
 
 FilterStatus ConnectionManager::ResponseDecoder::stringValue(absl::string_view value) {
-  return parent_.applyEncoderFilters(DecoderEvent::StringValue, std::string(value),
-                                     protocol_converter_);
+  const bool record_payload = !payload_probe_recorded_ && payload_probe_candidate_.has_value() &&
+                              value.size() >= LargePayloadProbeThresholdBytes;
+  uint64_t connection_id = 0;
+  if (record_payload) {
+    connection_id = parent_.parent_.read_callbacks_->connection().id();
+    payload_probe_recorded_ = true;
+    KITEX_PROBE_AT(connection_id, "resp_payload_read_start", *payload_probe_candidate_);
+    KITEX_PROBE_IF_SAMPLED(connection_id, "resp_payload_read_done", parent_.parent_.time_source_);
+  }
+  payload_probe_candidate_.reset();
+
+  const FilterStatus status = parent_.applyEncoderFilters(DecoderEvent::StringValue,
+                                                          std::string(value), protocol_converter_);
+  if (record_payload) {
+    KITEX_PROBE_IF_SAMPLED(connection_id, "resp_payload_encode_done", parent_.parent_.time_source_);
+  }
+  return status;
 }
 
 FilterStatus ConnectionManager::ResponseDecoder::mapBegin(FieldType& key_type,
@@ -780,8 +834,8 @@ FilterStatus ConnectionManager::ActiveRpc::transportBegin(MessageMetadataSharedP
   // E2 TTHeader 解析完成，trace 在此刻才可知。
   // 这一步同时把 E1 暂存的事件回填到该 trace，并确定后续点是否记录。
   KITEX_PROBE_BIND(parent_.read_callbacks_->connection().id(),
-                   metadata->hasSequenceId() ? metadata->sequenceId() : 0,
-                   traceparentOf(*metadata), parent_.time_source_);
+                   metadata->hasSequenceId() ? metadata->sequenceId() : 0, traceparentOf(*metadata),
+                   parent_.time_source_);
   return applyDecoderFilters(DecoderEvent::TransportBegin, metadata);
 }
 
@@ -920,7 +974,16 @@ void ConnectionManager::ActiveRpc::recordResponseAccessLog(const std::string& me
 
 FilterStatus ConnectionManager::ActiveRpc::passthroughData(Buffer::Instance& data) {
   passthrough_ = true;
-  return applyDecoderFilters(DecoderEvent::PassthroughData, &data);
+  if (!body_mode_recorded_) {
+    body_mode_recorded_ = true;
+    KITEX_PROBE_IF_SAMPLED(parent_.read_callbacks_->connection().id(), "req_body_passthrough",
+                           parent_.time_source_);
+  }
+  const uint64_t connection_id = parent_.read_callbacks_->connection().id();
+  KITEX_PROBE_IF_SAMPLED(connection_id, "req_passthrough_move_start", parent_.time_source_);
+  const FilterStatus status = applyDecoderFilters(DecoderEvent::PassthroughData, &data);
+  KITEX_PROBE_IF_SAMPLED(connection_id, "req_passthrough_move_done", parent_.time_source_);
+  return status;
 }
 
 FilterStatus ConnectionManager::ActiveRpc::messageBegin(MessageMetadataSharedPtr metadata) {
@@ -1001,6 +1064,11 @@ FilterStatus ConnectionManager::ActiveRpc::messageEnd() {
 }
 
 FilterStatus ConnectionManager::ActiveRpc::structBegin(absl::string_view name) {
+  if (!body_mode_recorded_) {
+    body_mode_recorded_ = true;
+    KITEX_PROBE_IF_SAMPLED(parent_.read_callbacks_->connection().id(), "req_body_full_decode",
+                           parent_.time_source_);
+  }
   return applyDecoderFilters(DecoderEvent::StructBegin, std::string(name));
 }
 
@@ -1010,8 +1078,15 @@ FilterStatus ConnectionManager::ActiveRpc::structEnd() {
 
 FilterStatus ConnectionManager::ActiveRpc::fieldBegin(absl::string_view name, FieldType& field_type,
                                                       int16_t& field_id) {
-  return applyDecoderFilters(DecoderEvent::FieldBegin,
-                             std::make_tuple(std::string(name), field_type, field_id));
+  const FilterStatus status = applyDecoderFilters(
+      DecoderEvent::FieldBegin, std::make_tuple(std::string(name), field_type, field_id));
+  if (!payload_probe_recorded_ && field_type == FieldType::String) {
+    const uint64_t connection_id = parent_.read_callbacks_->connection().id();
+    if (KITEX_PROBE_SAMPLED(connection_id)) {
+      payload_probe_candidate_ = parent_.time_source_.monotonicTime();
+    }
+  }
+  return status;
 }
 
 FilterStatus ConnectionManager::ActiveRpc::fieldEnd() {
@@ -1043,7 +1118,22 @@ FilterStatus ConnectionManager::ActiveRpc::doubleValue(double& value) {
 }
 
 FilterStatus ConnectionManager::ActiveRpc::stringValue(absl::string_view value) {
-  return applyDecoderFilters(DecoderEvent::StringValue, std::string(value));
+  const bool record_payload = !payload_probe_recorded_ && payload_probe_candidate_.has_value() &&
+                              value.size() >= LargePayloadProbeThresholdBytes;
+  uint64_t connection_id = 0;
+  if (record_payload) {
+    connection_id = parent_.read_callbacks_->connection().id();
+    payload_probe_recorded_ = true;
+    KITEX_PROBE_AT(connection_id, "req_payload_read_start", *payload_probe_candidate_);
+    KITEX_PROBE_IF_SAMPLED(connection_id, "req_payload_read_done", parent_.time_source_);
+  }
+  payload_probe_candidate_.reset();
+
+  const FilterStatus status = applyDecoderFilters(DecoderEvent::StringValue, std::string(value));
+  if (record_payload) {
+    KITEX_PROBE_IF_SAMPLED(connection_id, "req_payload_encode_done", parent_.time_source_);
+  }
+  return status;
 }
 
 FilterStatus ConnectionManager::ActiveRpc::mapBegin(FieldType& key_type, FieldType& value_type,

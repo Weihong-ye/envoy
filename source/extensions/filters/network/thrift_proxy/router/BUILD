@@ -94,8 +94,6 @@ envoy_cc_library(
     srcs = ["router_impl.cc"],
     hdrs = ["router_impl.h"],
     deps = [
-        "//source/common/kitex_probe:kitex_probe_lib",
-        "//source/common/network:default_socket_interface_lib",
         ":router_interface",
         ":router_ratelimit_lib",
         ":shadow_writer_lib",
@@ -105,6 +103,8 @@ envoy_cc_library(
         "//envoy/upstream:load_balancer_interface",
         "//envoy/upstream:thread_local_cluster_interface",
         "//source/common/http:header_utility_lib",
+        "//source/common/kitex_probe:kitex_probe_lib",
+        "//source/common/network:default_socket_interface_lib",
         "//source/common/router:metadatamatchcriteria_lib",
         "//source/common/upstream:load_balancer_context_base_lib",
         "//source/extensions/filters/network/thrift_proxy:app_exception_lib",

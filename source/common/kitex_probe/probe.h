@@ -41,8 +41,7 @@ namespace KitexProbe {
  *
  * 只有 E1（下游首字节到达）用这个 —— 它是唯一早于 TTHeader 解析的点。
  */
-void connEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono,
-               SystemTime wall);
+void connEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono, SystemTime wall);
 
 /**
  * 把某条连接上的待定事件绑定到具体 trace，并确定采样与否。
@@ -51,8 +50,8 @@ void connEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono,
  * 解析失败或 sampled 位未置时，该连接上的待定事件被丢弃，
  * 后续 rpcEvent 也会快速返回。
  */
-void bindTrace(uint64_t conn_id, int32_t seq_id, absl::string_view traceparent,
-               MonotonicTime mono, SystemTime wall);
+void bindTrace(uint64_t conn_id, int32_t seq_id, absl::string_view traceparent, MonotonicTime mono,
+               SystemTime wall);
 
 /**
  * 下游读路径的时间戳槽位。
@@ -79,6 +78,14 @@ void connSlot(uint64_t conn_id, Slot which, MonotonicTime mono);
  * 每点省下一次 vDSO 调用，8 个点约省 175 ns/请求。
  */
 void rpcEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono);
+
+/**
+ * Record an RPC event while avoiding a clock read for unbound or unsampled RPCs.
+ *
+ * This is intended for fine-grained phase probes: checking the binding is cheaper than adding a
+ * monotonic clock read to every request merely to discard the event in rpcEvent().
+ */
+void rpcEventIfSampled(uint64_t conn_id, absl::string_view point, TimeSource& time_source);
 
 /**
  * 记录**响应写出**这类「RPC 已结束但事件还没发生」的点位。
@@ -152,6 +159,9 @@ Stats stats();
 #define KITEX_PROBE(conn_id, point, time_source)                                                   \
   ::Envoy::KitexProbe::rpcEvent((conn_id), (point), (time_source).monotonicTime())
 
+#define KITEX_PROBE_IF_SAMPLED(conn_id, point, time_source)                                        \
+  ::Envoy::KitexProbe::rpcEventIfSampled((conn_id), (point), (time_source))
+
 #define KITEX_PROBE_END(conn_id) ::Envoy::KitexProbe::endRpc((conn_id))
 
 #define KITEX_PROBE_SAMPLED(conn_id) ::Envoy::KitexProbe::isSampled((conn_id))
@@ -179,6 +189,9 @@ Stats stats();
   do {                                                                                             \
   } while (0)
 #define KITEX_PROBE(conn_id, point, time_source)                                                   \
+  do {                                                                                             \
+  } while (0)
+#define KITEX_PROBE_IF_SAMPLED(conn_id, point, time_source)                                        \
   do {                                                                                             \
   } while (0)
 #define KITEX_PROBE_END(conn_id)                                                                   \

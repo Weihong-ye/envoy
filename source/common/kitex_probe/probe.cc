@@ -1,11 +1,12 @@
 #include "source/common/kitex_probe/probe.h"
 
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include <atomic>
-#include <memory>
 #include <cstdio>
 #include <cstdlib>
-#include <unistd.h>
-#include <sys/syscall.h>
+#include <memory>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
@@ -287,8 +288,8 @@ void reportStatsAtExit() {
   std::fprintf(stderr,
                "[probe] node=%s host=%s 记录=%llu 落盘=%llu 丢弃=%llu 下游写未归属=%llu%s\n",
                cfg.node.c_str(), cfg.host.c_str(), static_cast<unsigned long long>(recorded),
-               static_cast<unsigned long long>(written),
-               static_cast<unsigned long long>(dropped), static_cast<unsigned long long>(wlost),
+               static_cast<unsigned long long>(written), static_cast<unsigned long long>(dropped),
+               static_cast<unsigned long long>(wlost),
                (recorded == written && dropped == 0) ? "" : "  ← 有数据未落盘");
   if (wlost > 0) {
     std::fprintf(stderr,
@@ -441,6 +442,21 @@ void rpcEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono) {
   const auto& b = it->second;
   const int64_t m = monoNs(mono);
   // wall 由基准点推算，不再读 CLOCK_REALTIME
+  push(st, Event{b.trace, point, m, b.base_wall + (m - b.base_mono), b.seq_id});
+}
+
+void rpcEventIfSampled(uint64_t conn_id, absl::string_view point, TimeSource& time_source) {
+  if (!config().enabled) {
+    return;
+  }
+  auto& st = tls();
+  auto it = st.bindings.find(conn_id);
+  if (it == st.bindings.end() || !it->second.sampled) {
+    return;
+  }
+
+  const auto& b = it->second;
+  const int64_t m = monoNs(time_source.monotonicTime());
   push(st, Event{b.trace, point, m, b.base_wall + (m - b.base_mono), b.seq_id});
 }
 

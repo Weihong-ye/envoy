@@ -1,7 +1,5 @@
 #include "source/extensions/filters/network/thrift_proxy/router/router_impl.h"
 
-#include "source/common/kitex_probe/probe.h"
-
 #include <memory>
 
 #include "envoy/extensions/filters/network/thrift_proxy/v3/route.pb.h"
@@ -9,6 +7,7 @@
 #include "envoy/upstream/thread_local_cluster.h"
 
 #include "source/common/common/utility.h"
+#include "source/common/kitex_probe/probe.h"
 #if defined(__linux__)
 #include "source/common/network/ub_socket_handle_impl.h"
 #endif
@@ -270,9 +269,8 @@ void Router::setDecoderFilterCallbacks(ThriftFilters::DecoderFilterCallbacks& ca
   // encoded request must remain heap-backed.
   const bool ub_destination = callbacks.connection() != nullptr &&
                               Network::Ubsocket::connectionUsesUbUdsRead(*callbacks.connection());
-  upstream_request_buffer_ =
-      std::make_unique<Buffer::OwnedImpl>(
-          Network::Ubsocket::createOutputSliceFactory(ub_destination));
+  upstream_request_buffer_ = std::make_unique<Buffer::OwnedImpl>(
+      Network::Ubsocket::createOutputSliceFactory(ub_destination));
 #else
   upstream_request_buffer_ = std::make_unique<Buffer::OwnedImpl>();
 #endif
@@ -360,6 +358,10 @@ FilterStatus Router::messageBegin(MessageMetadataSharedPtr metadata) {
 
 FilterStatus Router::messageEnd() {
   ProtocolConverter::messageEnd();
+  if (callbacks_->connection() != nullptr) {
+    KITEX_PROBE_IF_SAMPLED(callbacks_->connection()->id(), "req_body_encode_done",
+                           callbacks_->streamInfo().timeSource());
+  }
   const auto encode_size = upstream_request_->encodeAndWrite(*upstream_request_buffer_);
   // E6 请求已编码并写往上游
   if (callbacks_->connection() != nullptr) {
