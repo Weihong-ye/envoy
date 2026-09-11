@@ -50,7 +50,26 @@ void OwnedImpl::addImpl(const void* data, uint64_t size) {
   bool new_slice_needed = slices_.empty();
   while (size != 0) {
     if (new_slice_needed) {
-      slices_.emplace_back(Slice(size, account_));
+      if (slice_factory_) {
+        struct Context {
+          OwnedImpl& buffer;
+          const char*& src;
+          uint64_t& remaining;
+        } context{*this, src, size};
+        const uint64_t before = size;
+        slice_factory_(size, 9, &context, [](void* opaque, Slice&& slice) {
+          auto& ctx = *static_cast<Context*>(opaque);
+          const uint64_t copied = slice.append(ctx.src, ctx.remaining);
+          RELEASE_ASSERT(copied != 0, "slice factory returned no writable capacity");
+          ctx.buffer.length_ += copied;
+          ctx.src += copied;
+          ctx.remaining -= copied;
+          ctx.buffer.slices_.emplace_back(std::move(slice));
+        });
+        RELEASE_ASSERT(size < before, "slice factory returned no slices");
+        continue;
+      }
+      slices_.emplace_back(makeSlice(size));
     }
     uint64_t copy_size = slices_.back().append(src, size);
     src += copy_size;
@@ -79,6 +98,21 @@ void OwnedImpl::addBufferFragment(BufferFragment& fragment) {
   slices_.emplace_back(fragment);
 }
 
+void OwnedImpl::addExternalSlice(Slice&& slice) {
+  ASSERT(slice.hasExternalStorage());
+  length_ += slice.dataSize();
+  slices_.emplace_back(std::move(slice));
+}
+
+OwnedImpl::~OwnedImpl() {
+  if (slices_.size() > 1 && slices_.front().hasExternalStorage()) {
+    ExternalStorageReleaseBatch batch;
+    while (!slices_.empty()) {
+      slices_.pop_front();
+    }
+  }
+}
+
 void OwnedImpl::add(absl::string_view data) { add(data.data(), data.size()); }
 
 void OwnedImpl::add(const Instance& data) {
@@ -93,7 +127,7 @@ void OwnedImpl::prepend(absl::string_view data) {
   bool new_slice_needed = slices_.empty();
   while (size != 0) {
     if (new_slice_needed) {
-      slices_.emplace_front(Slice(size, account_));
+      slices_.emplace_front(makeSlice(size));
     }
     uint64_t copy_size = slices_.front().prepend(data.data(), size);
     size -= copy_size;
@@ -182,6 +216,10 @@ uint64_t OwnedImpl::copyOutToSlices(uint64_t size, Buffer::RawSlice* dest_slices
 void OwnedImpl::drain(uint64_t size) { drainImpl(size); }
 
 void OwnedImpl::drainImpl(uint64_t size) {
+  std::optional<ExternalStorageReleaseBatch> batch;
+  if (slices_.size() > 1 && slices_.front().hasExternalStorage()) {
+    batch.emplace();
+  }
   while (size != 0) {
     if (slices_.empty()) {
       break;
@@ -292,7 +330,8 @@ void* OwnedImpl::linearize(uint32_t size) {
     return nullptr;
   }
   if (slices_[0].dataSize() < size) {
-    Slice new_slice{size, account_};
+    // linearize promises one contiguous range, unlike a bounded external Slice factory.
+    Slice new_slice(size, account_);
     Slice::Reservation reservation = new_slice.reserve(size);
     ASSERT(reservation.mem_ != nullptr);
     ASSERT(reservation.len_ == size);
@@ -622,6 +661,24 @@ bool OwnedImpl::startsWith(absl::string_view data) const {
 
 OwnedImpl::OwnedImpl() = default;
 
+OwnedImpl::OwnedImpl(OwnedImpl&& other) noexcept
+    : slices_(std::move(other.slices_)), length_(other.length_),
+      account_(std::move(other.account_)), slice_factory_(std::move(other.slice_factory_)) {
+  other.length_ = OverflowDetectingUInt64{};
+}
+
+OwnedImpl& OwnedImpl::operator=(OwnedImpl&& other) noexcept {
+  if (this != &other) {
+    drainImpl(length_);
+    slices_ = std::move(other.slices_);
+    length_ = other.length_;
+    other.length_ = OverflowDetectingUInt64{};
+    account_ = std::move(other.account_);
+    slice_factory_ = std::move(other.slice_factory_);
+  }
+  return *this;
+}
+
 OwnedImpl::OwnedImpl(absl::string_view data) : OwnedImpl() { add(data); }
 
 OwnedImpl::OwnedImpl(const Instance& data) : OwnedImpl() { add(data); }
@@ -629,6 +686,20 @@ OwnedImpl::OwnedImpl(const Instance& data) : OwnedImpl() { add(data); }
 OwnedImpl::OwnedImpl(const void* data, uint64_t size) : OwnedImpl() { add(data, size); }
 
 OwnedImpl::OwnedImpl(BufferMemoryAccountSharedPtr account) : account_(std::move(account)) {}
+
+OwnedImpl::OwnedImpl(SliceFactory slice_factory) : slice_factory_(std::move(slice_factory)) {}
+
+Slice OwnedImpl::makeSlice(uint64_t min_capacity) {
+  if (!slice_factory_) {
+    return Slice(min_capacity, account_);
+  }
+  Slice result;
+  slice_factory_(min_capacity, 1, &result, [](void* opaque, Slice&& slice) {
+    *static_cast<Slice*>(opaque) = std::move(slice);
+  });
+  RELEASE_ASSERT(result.reservableSize() != 0, "slice factory returned no writable capacity");
+  return result;
+}
 
 std::string OwnedImpl::toString() const {
   std::string output;
@@ -643,7 +714,7 @@ std::string OwnedImpl::toString() const {
 void OwnedImpl::postProcess() {}
 
 void OwnedImpl::appendSliceForTest(const void* data, uint64_t size) {
-  slices_.emplace_back(Slice(size, account_));
+  slices_.emplace_back(makeSlice(size));
   slices_.back().append(data, size);
   length_ += size;
 }
@@ -661,6 +732,14 @@ std::vector<Slice::SliceRepresentation> OwnedImpl::describeSlicesForTest() const
 }
 
 size_t OwnedImpl::addFragments(absl::Span<const absl::string_view> fragments) {
+  if (slice_factory_) {
+    size_t copied = 0;
+    for (const auto& fragment : fragments) {
+      addImpl(fragment.data(), fragment.size());
+      copied += fragment.size();
+    }
+    return copied;
+  }
   size_t total_size_to_copy = 0;
 
   for (const auto& fragment : fragments) {
@@ -668,7 +747,7 @@ size_t OwnedImpl::addFragments(absl::Span<const absl::string_view> fragments) {
   }
 
   if (slices_.empty()) {
-    slices_.emplace_back(Slice(total_size_to_copy, account_));
+    slices_.emplace_back(makeSlice(total_size_to_copy));
   }
 
   Slice& back = slices_.back();
@@ -713,7 +792,7 @@ size_t OwnedImpl::addFragments(absl::Span<const absl::string_view> fragments) {
         remaining_size += fragments[i].size();
       }
 
-      slices_.emplace_back(Slice(remaining_size, account_));
+      slices_.emplace_back(makeSlice(remaining_size));
       Slice& new_slice = slices_.back();
       Slice::Reservation new_reservation = new_slice.reserve(remaining_size);
       ASSERT(new_reservation.len_ == remaining_size);

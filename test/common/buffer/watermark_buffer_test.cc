@@ -68,6 +68,38 @@ TEST_F(WatermarkBufferTest, AddBuffer) {
   EXPECT_EQ(11, buffer_.length());
 }
 
+TEST_F(WatermarkBufferTest, AddBufferFragment) {
+  bool released = false;
+  BufferFragmentImpl fragment(
+      "hello world", 11,
+      [&released](const void*, size_t, const BufferFragmentImpl*) { released = true; });
+
+  buffer_.addBufferFragment(fragment);
+  EXPECT_EQ(1, times_high_watermark_called_);
+  EXPECT_EQ(11, buffer_.length());
+  EXPECT_FALSE(released);
+
+  buffer_.drain(buffer_.length());
+  EXPECT_EQ(1, times_low_watermark_called_);
+  EXPECT_TRUE(released);
+}
+
+TEST_F(WatermarkBufferTest, ExternalSlicePreservesWatermarksAndPartialDrainLifetime) {
+  bool released = false;
+  // Dispatch through OwnedImpl, as the network read path does.
+  OwnedImpl& owned = buffer_;
+  owned.addExternalSlice(
+      Slice(static_cast<const void*>("hello world"), 11, [&released]() { released = true; }));
+  EXPECT_EQ(1, times_high_watermark_called_);
+  EXPECT_EQ("hello world", buffer_.toString());
+  buffer_.drain(7);
+  EXPECT_FALSE(released);
+  EXPECT_EQ(1, times_low_watermark_called_);
+  EXPECT_EQ("orld", buffer_.toString());
+  buffer_.drain(buffer_.length());
+  EXPECT_TRUE(released);
+}
+
 TEST_F(WatermarkBufferTest, Prepend) {
   std::string suffix = "World!", prefix = "Hello, ";
 

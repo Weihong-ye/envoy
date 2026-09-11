@@ -25,6 +25,16 @@ void WatermarkBuffer::add(const void* data, uint64_t size) {
   checkHighAndOverflowWatermarks();
 }
 
+void WatermarkBuffer::addBufferFragment(BufferFragment& fragment) {
+  OwnedImpl::addBufferFragment(fragment);
+  checkHighAndOverflowWatermarks();
+}
+
+void WatermarkBuffer::addExternalSlice(Slice&& slice) {
+  OwnedImpl::addExternalSlice(std::move(slice));
+  checkHighAndOverflowWatermarks();
+}
+
 void WatermarkBuffer::add(absl::string_view data) {
   OwnedImpl::add(data);
   checkHighAndOverflowWatermarks();

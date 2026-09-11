@@ -19,6 +19,51 @@
 namespace Envoy {
 namespace Buffer {
 
+// A bounded return list, not a payload cache. Callers enqueue only zero-reference
+// allocation bases, and all entries return to their allocator before scope exit.
+class ExternalStorageReleaseBatch {
+public:
+  using FreeFn = void (*)(void* const*, uint32_t);
+  ExternalStorageReleaseBatch() : previous_(active()) { active() = this; }
+  ExternalStorageReleaseBatch(const ExternalStorageReleaseBatch&) = delete;
+  ExternalStorageReleaseBatch& operator=(const ExternalStorageReleaseBatch&) = delete;
+  ~ExternalStorageReleaseBatch() {
+    flush();
+    active() = previous_;
+  }
+  static void release(void* block, FreeFn free_fn) {
+    auto* batch = active();
+    if (batch == nullptr) {
+      free_fn(&block, 1);
+      return;
+    }
+    if (batch->free_fn_ != free_fn) {
+      batch->flush();
+      batch->free_fn_ = free_fn;
+    }
+    batch->blocks_[batch->count_++] = block;
+    if (batch->count_ == 16) {
+      batch->flush();
+    }
+  }
+
+private:
+  static ExternalStorageReleaseBatch*& active() {
+    static thread_local ExternalStorageReleaseBatch* batch = nullptr;
+    return batch;
+  }
+  void flush() {
+    if (count_ != 0) {
+      free_fn_(blocks_, count_);
+      count_ = 0;
+    }
+  }
+  ExternalStorageReleaseBatch* previous_;
+  FreeFn free_fn_{nullptr};
+  void* blocks_[16];
+  uint32_t count_{0};
+};
+
 /**
  * A Slice manages a contiguous block of bytes.
  * The block is arranged like this:
@@ -38,6 +83,7 @@ class Slice {
 public:
   using Reservation = RawSlice;
   using StoragePtr = std::unique_ptr<uint8_t[]>;
+  using Releasor = std::function<void()>;
 
   struct SizedStorage {
     StoragePtr mem_;
@@ -85,6 +131,21 @@ public:
   }
 
   /**
+   * Create an empty mutable Slice backed by externally allocated storage.
+   *
+   * The releasor owns the storage lifetime. External mutable slices are appendable while they
+   * remain in a buffer, but are deliberately not coalesced during Buffer::move(), because doing so
+   * would copy hardware-owned storage into a destination heap slice.
+   */
+  Slice(uint8_t* storage, uint64_t capacity, Releasor releasor)
+      : capacity_(capacity), base_(storage), releasor_(std::move(releasor)),
+        mutable_external_(true) {
+    ASSERT(storage != nullptr);
+    ASSERT(capacity != 0);
+    ASSERT(releasor_ != nullptr);
+  }
+
+  /**
    * Create an immutable Slice that refers to an external buffer fragment.
    * @param fragment provides externally owned immutable data.
    */
@@ -95,6 +156,13 @@ public:
     releasor_ = [&fragment]() { fragment.done(); };
   }
 
+  // Same immutable ownership contract as BufferFragment without a separate heap object.
+  Slice(const void* data, uint64_t size, Releasor releasor)
+      : capacity_(size), base_(static_cast<uint8_t*>(const_cast<void*>(data))), reservable_(size),
+        releasor_(std::move(releasor)) {}
+
+  bool hasExternalStorage() const { return releasor_ != nullptr; }
+
   Slice(Slice&& rhs) noexcept {
     capacity_ = rhs.capacity_;
     storage_ = std::move(rhs.storage_);
@@ -103,12 +171,14 @@ public:
     reservable_ = rhs.reservable_;
     drain_trackers_ = std::move(rhs.drain_trackers_);
     account_ = std::move(rhs.account_);
+    mutable_external_ = rhs.mutable_external_;
     releasor_.swap(rhs.releasor_);
 
     rhs.capacity_ = 0;
     rhs.base_ = nullptr;
     rhs.data_ = 0;
     rhs.reservable_ = 0;
+    rhs.mutable_external_ = false;
   }
 
   Slice& operator=(Slice&& rhs) noexcept {
@@ -122,16 +192,18 @@ public:
       reservable_ = rhs.reservable_;
       drain_trackers_ = std::move(rhs.drain_trackers_);
       account_ = std::move(rhs.account_);
+      mutable_external_ = rhs.mutable_external_;
       if (releasor_) {
         releasor_();
       }
-      releasor_ = rhs.releasor_;
+      releasor_ = std::move(rhs.releasor_);
       rhs.releasor_ = nullptr;
 
       rhs.capacity_ = 0;
       rhs.base_ = nullptr;
       rhs.data_ = 0;
       rhs.reservable_ = 0;
+      rhs.mutable_external_ = false;
     }
 
     return *this;
@@ -147,7 +219,7 @@ public:
   /**
    * @return true if the data in the slice is mutable
    */
-  bool isMutable() const { return storage_ != nullptr; }
+  bool isMutable() const { return storage_ != nullptr || mutable_external_; }
 
   /**
    * @return true if content in this Slice can be coalesced into another Slice.
@@ -335,7 +407,7 @@ public:
    * - the slice owns backing memory
    */
   void maybeChargeAccount(const BufferMemoryAccountSharedPtr& account) {
-    if (account_ != nullptr || storage_ == nullptr || account == nullptr) {
+    if (account_ != nullptr || !isMutable() || account == nullptr) {
       return;
     }
     account->charge(capacity_);
@@ -395,7 +467,10 @@ protected:
   BufferMemoryAccountSharedPtr account_;
 
   /** The releasor for the BufferFragment */
-  std::function<void()> releasor_;
+  Releasor releasor_;
+
+  /** Whether externally owned storage is mutable. */
+  bool mutable_external_{false};
 };
 
 class OwnedImpl;
@@ -435,9 +510,16 @@ public:
     start_ = rhs.start_;
     size_ = rhs.size_;
     capacity_ = rhs.capacity_;
+    rhs.ring_ = rhs.inline_ring_;
+    rhs.start_ = 0;
+    rhs.size_ = 0;
+    rhs.capacity_ = InlineRingCapacity;
   }
 
   SliceDeque& operator=(SliceDeque&& rhs) noexcept {
+    if (this == &rhs) {
+      return *this;
+    }
     // This custom assignment move operator is needed so that ring_ will be updated properly.
     std::move(rhs.inline_ring_, rhs.inline_ring_ + InlineRingCapacity, inline_ring_);
     external_ring_ = std::move(rhs.external_ring_);
@@ -445,6 +527,10 @@ public:
     start_ = rhs.start_;
     size_ = rhs.size_;
     capacity_ = rhs.capacity_;
+    rhs.ring_ = rhs.inline_ring_;
+    rhs.start_ = 0;
+    rhs.size_ = 0;
+    rhs.capacity_ = InlineRingCapacity;
     return *this;
   }
 
@@ -642,17 +728,27 @@ private:
  */
 class OwnedImpl : public LibEventInstance {
 public:
+  using SliceConsumer = void (*)(void*, Slice&&);
+  // The factory invokes consume synchronously, at most max_slices times, with nonempty
+  // capacity. Neither the consumer nor its context may be retained by the allocator.
+  using SliceFactory = std::function<void(uint64_t, uint32_t, void*, SliceConsumer)>;
+
   OwnedImpl();
+  OwnedImpl(OwnedImpl&& other) noexcept;
+  OwnedImpl& operator=(OwnedImpl&& other) noexcept;
   OwnedImpl(absl::string_view data);
   OwnedImpl(const Instance& data);
   OwnedImpl(const void* data, uint64_t size);
   OwnedImpl(BufferMemoryAccountSharedPtr account);
+  explicit OwnedImpl(SliceFactory slice_factory);
+  ~OwnedImpl() override;
 
   // Buffer::Instance
   void addDrainTracker(std::function<void()> drain_tracker) override;
   void bindAccount(BufferMemoryAccountSharedPtr account) override;
   void add(const void* data, uint64_t size) override;
   void addBufferFragment(BufferFragment& fragment) override;
+  virtual void addExternalSlice(Slice&& slice);
   void add(absl::string_view data) override;
   void add(const Instance& data) override;
   void prepend(absl::string_view data) override;
@@ -695,6 +791,10 @@ public:
    * @return the BufferMemoryAccount bound to this buffer, if any.
    */
   BufferMemoryAccountSharedPtr getAccountForTest();
+
+  /** Copy the per-buffer storage policy when constructing a temporary buffer for the same output.
+   */
+  const SliceFactory& sliceFactory() const { return slice_factory_; }
 
   // Does not implement watermarking.
   // TODO(antoniovicente) Implement watermarks by merging the OwnedImpl and WatermarkBuffer
@@ -741,6 +841,7 @@ private:
 
   void addImpl(const void* data, uint64_t size);
   void drainImpl(uint64_t size);
+  Slice makeSlice(uint64_t min_capacity);
 
   /**
    * Moves contents of the `other_slice` by either taking its ownership or coalescing it
@@ -756,6 +857,9 @@ private:
   OverflowDetectingUInt64 length_;
 
   BufferMemoryAccountSharedPtr account_;
+
+  /** Optional per-buffer storage policy. Empty preserves the standard heap-backed behavior. */
+  SliceFactory slice_factory_;
 
   struct OwnedImplReservationSlicesOwner : public ReservationSlicesOwner {
     virtual absl::Span<Slice::SizedStorage> ownedStorages() PURE;
