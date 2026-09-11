@@ -705,6 +705,20 @@ TEST(AddressFromSockAddrDeathTest, IPv4) {
   EXPECT_THAT(addressFromSockAddr(ss, sizeof(sockaddr_in)), Not(IsOk()));
 }
 
+#if defined(__linux__) && !defined(__ANDROID_API__)
+TEST(AddressFromSockAddrDeathTest, UbsocketIpv4) {
+  sockaddr_storage ss{};
+  auto& sin = reinterpret_cast<sockaddr_in&>(ss);
+
+  // UBSocket uses AF_SMC for socket creation while retaining an IPv4 sockaddr layout.
+  sin.sin_family = AF_SMC;
+  EXPECT_EQ(1, inet_pton(AF_INET, "1.2.3.4", &sin.sin_addr));
+  sin.sin_port = htons(6502);
+
+  EXPECT_EQ("1.2.3.4:6502", (*addressFromSockAddr(ss, sizeof(sockaddr_in)))->asString());
+}
+#endif
+
 TEST(AddressFromSockAddrDeathTest, IPv6) {
   sockaddr_storage ss;
   memset(&ss, 0, sizeof(ss));

@@ -325,8 +325,9 @@ struct mmsghdr {
 #endif // defined(__ANDROID_API__)
 
 #if defined(__linux__)
-// On Linux, default listen backlog size to net.core.somaxconn which is runtime configurable
-#define ENVOY_TCP_BACKLOG_SIZE -1
+// UBSocket also uses the listen backlog as the TCP_FASTOPEN queue length. Its setsockopt path
+// requires a non-negative value, so do not pass Envoy's Linux -1 sentinel to intercepted sockets.
+#define ENVOY_TCP_BACKLOG_SIZE 1024
 #else
 // On non-Linux platforms use 128 which is libevent listener default
 #define ENVOY_TCP_BACKLOG_SIZE 128

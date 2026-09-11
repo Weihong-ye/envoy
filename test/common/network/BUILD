@@ -14,6 +14,16 @@ licenses(["notice"])  # Apache 2
 
 envoy_package()
 
+envoy_cc_test(
+    name = "ub_address_selector_test",
+    srcs = ["ub_address_selector_test.cc"],
+    deps = [
+        "//source/common/network:ip_address_parsing_lib",
+        "//source/common/network:ub_address_selector_lib",
+        "//test/test_common:status_utility_lib",
+    ],
+)
+
 envoy_cc_test_library(
     name = "listener_impl_test_base_lib",
     hdrs = ["listener_impl_test_base.h"],
@@ -500,6 +510,33 @@ envoy_cc_test(
         "//test/mocks/api:api_mocks",
         "//test/test_common:threadsafe_singleton_injector_lib",
         "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "ub_socket_handle_impl_test",
+    srcs = select({
+        "//bazel:linux": ["ub_socket_handle_impl_test.cc"],
+        "//conditions:default": [],
+    }),
+    linkopts = select({
+        "//bazel:linux": [
+            "-Wl,--export-dynamic",
+            "-Wl,--undefined=ubsocket_iobuf_allocate",
+            "-Wl,--undefined=ubsocket_iobuf_allocate_batch",
+            "-Wl,--undefined=ubsocket_iobuf_deallocate",
+            "-Wl,--undefined=ubsocket_iobuf_deallocate_batch",
+            "-Wl,--undefined=ubsocket_readv",
+            "-Wl,--undefined=ubsocket_writev",
+        ],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//source/common/buffer:buffer_lib",
+        "//source/common/network:default_socket_interface_lib",
+        "//test/test_common:environment_lib",
+        "@abseil-cpp//absl/container:flat_hash_set",
+        "@abseil-cpp//absl/strings",
     ],
 )
 
