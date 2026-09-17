@@ -15,6 +15,7 @@
 #include "source/common/api/os_sys_calls_impl.h"
 #include "source/common/common/assert.h"
 #include "source/common/common/utility.h"
+#include "source/common/kitex_probe/probe.h"
 #include "source/common/network/io_socket_error_impl.h"
 
 #include "absl/container/inlined_vector.h"
@@ -222,6 +223,7 @@ Api::IoCallUint64Result UbUnixSocketHandleImpl::read(Buffer::Instance& buffer,
     return Api::ioCallUint64ResultNoError();
   }
 
+  KitexProbe::ScopedIoDetailPhase prepare(KitexProbe::IoDetailPhase::Prepare);
   const Ubsocket::Api& api = Ubsocket::Api::instance();
   if (!api.available()) {
     return failClosedResult(ENOSYS, "UB UDS read symbols unavailable", fd_);
@@ -251,10 +253,20 @@ Api::IoCallUint64Result UbUnixSocketHandleImpl::read(Buffer::Instance& buffer,
     remaining_capacity -= offered;
   }
   read_round_limited_ = read_round_limited_ || read_length < selected_capacity;
-  const Api::SysCallSizeResult syscall_result =
-      block_count == 1
-          ? Api::OsSysCallsSingleton::get().recv(fd_, iov[0].iov_base, iov[0].iov_len, 0)
-          : Api::OsSysCallsSingleton::get().readv(fd_, iov.data(), static_cast<int>(block_count));
+  prepare.finish();
+  const Api::SysCallSizeResult syscall_result = [&]() {
+    KitexProbe::ScopedIoDetailPhase syscall(KitexProbe::IoDetailPhase::Syscall);
+    return block_count == 1
+               ? Api::OsSysCallsSingleton::get().recv(fd_, iov[0].iov_base, iov[0].iov_len, 0)
+               : Api::OsSysCallsSingleton::get().readv(fd_, iov.data(),
+                                                       static_cast<int>(block_count));
+  }();
+  const uint64_t bytes =
+      syscall_result.return_value_ > 0 ? static_cast<uint64_t>(syscall_result.return_value_) : 0;
+  const uint64_t used_blocks = bytes == 0 ? 0 : (bytes + capacity - 1) / capacity;
+  KitexProbe::recordIoCall(bytes, read_length, block_count, block_count - used_blocks,
+                           syscall_result.return_value_ < 0 && isAgainError(syscall_result.errno_));
+  KitexProbe::ScopedIoDetailPhase commit(KitexProbe::IoDetailPhase::Commit);
   if (syscall_result.return_value_ <= 0) {
     Buffer::ExternalStorageReleaseBatch release_batch;
     for (size_t i = 0; i < block_count; ++i) {
@@ -331,6 +343,7 @@ Api::IoCallUint64Result UbSocketHandleImpl::read(Buffer::Instance& buffer,
     return Api::ioCallUint64ResultNoError();
   }
 
+  KitexProbe::ScopedIoDetailPhase prepare(KitexProbe::IoDetailPhase::Prepare);
   const Ubsocket::Api& api = Ubsocket::Api::instance();
   if (!api.available()) {
     return failClosedResult(ENOSYS, "ubsocket_readv symbols unavailable", fd_);
@@ -348,9 +361,16 @@ Api::IoCallUint64Result UbSocketHandleImpl::read(Buffer::Instance& buffer,
   }
 
   struct iovec iov = {anchor->data, capacity};
-  const ssize_t rc = api.readv_(fd_, &iov, 1);
+  prepare.finish();
+  ssize_t rc;
+  {
+    KitexProbe::ScopedIoDetailPhase syscall(KitexProbe::IoDetailPhase::Syscall);
+    rc = api.readv_(fd_, &iov, 1);
+  }
   const int saved_errno = errno;
   if (rc <= 0) {
+    KitexProbe::recordIoCall(0, capacity, 1, rc < 0 ? 1 : 0, rc < 0 && isAgainError(saved_errno));
+    KitexProbe::ScopedIoDetailPhase commit(KitexProbe::IoDetailPhase::Commit);
     releaseBlock(api, anchor);
     if (rc == 0) {
       return Api::ioCallUint64ResultNoError();
@@ -361,6 +381,7 @@ Api::IoCallUint64Result UbSocketHandleImpl::read(Buffer::Instance& buffer,
     return failClosedResult(saved_errno, "ubsocket_readv", fd_);
   }
 
+  KitexProbe::ScopedIoDetailPhase commit(KitexProbe::IoDetailPhase::Commit);
   absl::InlinedVector<Ubsocket::Block*, 64> blocks;
   Ubsocket::Block* block = anchor->u.next;
   uint64_t received = 0;
@@ -380,6 +401,8 @@ Api::IoCallUint64Result UbSocketHandleImpl::read(Buffer::Instance& buffer,
     block = block->u.next;
   }
   valid = valid && received == static_cast<uint64_t>(rc) && block == nullptr;
+  KitexProbe::recordIoCall(static_cast<uint64_t>(rc), static_cast<uint64_t>(rc), blocks.size(), 0,
+                           false);
 
   if (!valid) {
     Ubsocket::Block* chain = anchor->u.next;
@@ -400,6 +423,7 @@ Api::IoCallUint64Result UbSocketHandleImpl::read(Buffer::Instance& buffer,
 
 Api::IoCallUint64Result UbSocketHandleImpl::writev(const Buffer::RawSlice* slices,
                                                    uint64_t num_slice) {
+  KitexProbe::ScopedIoDetailPhase prepare(KitexProbe::IoDetailPhase::Prepare);
   const Ubsocket::Api& api = Ubsocket::Api::instance();
   if (!api.available()) {
     return failClosedResult(ENOSYS, "ubsocket_writev symbols unavailable", fd_);
@@ -409,6 +433,7 @@ Api::IoCallUint64Result UbSocketHandleImpl::writev(const Buffer::RawSlice* slice
   }
 
   absl::InlinedVector<struct iovec, 64> iov;
+  uint64_t bytes_to_write = 0;
   iov.reserve(std::min<uint64_t>(num_slice, MaxUbsocketIov));
   for (uint64_t i = 0; i < num_slice; ++i) {
     if (slices[i].mem_ != nullptr && slices[i].len_ != 0) {
@@ -416,14 +441,22 @@ Api::IoCallUint64Result UbSocketHandleImpl::writev(const Buffer::RawSlice* slice
         return failClosedResult(E2BIG, "ubsocket_writev iovec limit", fd_);
       }
       iov.push_back({slices[i].mem_, slices[i].len_});
+      bytes_to_write += slices[i].len_;
     }
   }
   if (iov.empty()) {
     return Api::ioCallUint64ResultNoError();
   }
 
-  const ssize_t rc = api.writev_(fd_, iov.data(), static_cast<int>(iov.size()));
+  prepare.finish();
+  ssize_t rc;
+  {
+    KitexProbe::ScopedIoDetailPhase syscall(KitexProbe::IoDetailPhase::Syscall);
+    rc = api.writev_(fd_, iov.data(), static_cast<int>(iov.size()));
+  }
   const int saved_errno = errno;
+  KitexProbe::recordIoCall(rc > 0 ? static_cast<uint64_t>(rc) : 0, bytes_to_write, iov.size(), 0,
+                           rc < 0 && isAgainError(saved_errno));
   if (rc < 0) {
     if (isAgainError(saved_errno)) {
       return againResult();

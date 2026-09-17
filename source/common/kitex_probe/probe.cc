@@ -29,6 +29,34 @@ struct Parsed {
   absl::string_view trace_id;
 };
 
+struct IoDetailMetrics {
+  uint64_t prepare_ns{0};
+  uint64_t syscall_ns{0};
+  uint64_t commit_ns{0};
+  uint64_t calls{0};
+  uint64_t bytes{0};
+  uint64_t capacity{0};
+  uint64_t items{0};
+  uint64_t unused_items{0};
+  uint64_t eagain{0};
+  uint64_t partial{0};
+
+  void add(const IoDetailMetrics& other) {
+    prepare_ns += other.prepare_ns;
+    syscall_ns += other.syscall_ns;
+    commit_ns += other.commit_ns;
+    calls += other.calls;
+    bytes += other.bytes;
+    capacity += other.capacity;
+    items += other.items;
+    unused_items += other.unused_items;
+    eagain += other.eagain;
+    partial += other.partial;
+  }
+
+  bool empty() const { return prepare_ns == 0 && syscall_ns == 0 && commit_ns == 0 && calls == 0; }
+};
+
 Parsed parseTraceparent(absl::string_view tp) {
   Parsed p;
   if (tp.size() != TraceparentLen || tp[2] != '-' || tp[35] != '-' || tp[52] != '-') {
@@ -65,11 +93,18 @@ Parsed parseTraceparent(absl::string_view tp) {
 // binding 持有 shared_ptr<const std::string>，事件只拷指针。
 // point 是短名字（SSO 内，无分配），且都是字面量，直接存 string_view。
 struct Event {
+  Event(std::shared_ptr<const std::string> trace_value, absl::string_view point_value,
+        int64_t mono_value, int64_t wall_value, int32_t seq_value)
+      : trace(std::move(trace_value)), point(point_value), mono_ns(mono_value), wall_ns(wall_value),
+        seq_id(seq_value) {}
+
   std::shared_ptr<const std::string> trace;
   absl::string_view point; // 指向静态字面量，生命周期长于事件
   int64_t mono_ns;
   int64_t wall_ns;
   int32_t seq_id;
+  bool has_io_detail{false};
+  IoDetailMetrics io_detail;
 };
 
 // 某条连接上「已解析出 trace、正在处理」的 RPC 状态。
@@ -92,7 +127,11 @@ struct ConnSlots {
   int64_t epoll_wake{0};
   int64_t readv_start{0};
   int64_t readv_done{0};
+  int64_t io_detail_mono{0};
+  IoDetailMetrics io_detail;
 };
+
+thread_local ScopedIoDetail* active_io_detail = nullptr;
 
 // 每 worker 线程一份。Envoy 的 worker 是单线程事件循环，
 // 所以这里既不需要锁，也不存在伪共享。
@@ -145,6 +184,7 @@ public:
   // 常开的文件句柄。每次 writeOut 都 fopen/fclose 的话，
   // 在高 QPS 下 open 系统调用本身就会成为可观的开销。
   FILE* fp{nullptr};
+  bool schema_written{false};
 };
 
 ThreadState& tls() {
@@ -249,14 +289,36 @@ void writeOut(ThreadState& st, std::vector<Event>& events) {
     events.clear();
     return;
   }
+  if (!st.schema_written) {
+    absl::FPrintF(f,
+                  R"({"type":"meta","schema":"envoy-kitex-probe-v2","host":"%s","node":"%s"})"
+                  "\n",
+                  cfg.host, cfg.node);
+    st.schema_written = true;
+  }
   for (const auto& e : events) {
     // 字段与 Kitex 侧 probe 包保持一致，merge 工具才能统一处理。
     // wall 仅供粗排序，跨机相减由 merge 工具拒绝（设计文档 §8.2）。
-    absl::FPrintF(f,
-                  R"({"host":"%s","node":"%s","trace":"%s","point":"%s","wall_ns":%d,"mono_ns":%d,)"
-                  R"("attrs":{"seq_id":"%d"}})"
-                  "\n",
-                  cfg.host, cfg.node, *e.trace, e.point, e.wall_ns, e.mono_ns, e.seq_id);
+    if (e.has_io_detail) {
+      const IoDetailMetrics& d = e.io_detail;
+      absl::FPrintF(
+          f,
+          R"({"host":"%s","node":"%s","trace":"%s","point":"%s","wall_ns":%d,"mono_ns":%d,)"
+          R"("attrs":{"seq_id":"%d","prepare_ns":"%u","syscall_ns":"%u",)"
+          R"("commit_ns":"%u","calls":"%u","bytes":"%u","capacity":"%u",)"
+          R"("items":"%u","unused_items":"%u","eagain":"%u","partial":"%u"}})"
+          "\n",
+          cfg.host, cfg.node, *e.trace, e.point, e.wall_ns, e.mono_ns, e.seq_id, d.prepare_ns,
+          d.syscall_ns, d.commit_ns, d.calls, d.bytes, d.capacity, d.items, d.unused_items,
+          d.eagain, d.partial);
+    } else {
+      absl::FPrintF(
+          f,
+          R"({"host":"%s","node":"%s","trace":"%s","point":"%s","wall_ns":%d,"mono_ns":%d,)"
+          R"("attrs":{"seq_id":"%d"}})"
+          "\n",
+          cfg.host, cfg.node, *e.trace, e.point, e.wall_ns, e.mono_ns, e.seq_id);
+    }
   }
   g_written.fetch_add(events.size(), std::memory_order_relaxed);
   events.clear();
@@ -335,6 +397,145 @@ void configure(const std::string& path, const std::string& node) {
 
 bool enabled() { return config().enabled; }
 
+ScopedIoDetail::ScopedIoDetail(uint64_t conn_id, IoDetailKind kind, TimeSource& time_source)
+    : conn_id_(conn_id), kind_(kind), time_source_(time_source) {
+  if (!config().enabled) {
+    return;
+  }
+
+  auto& st = tls();
+  switch (kind_) {
+  case IoDetailKind::DownstreamRead:
+    active_ = true;
+    break;
+  case IoDetailKind::UpstreamRead:
+  case IoDetailKind::UpstreamWrite: {
+    const auto it = st.bindings.find(conn_id_);
+    active_ = it != st.bindings.end() && it->second.sampled;
+    break;
+  }
+  case IoDetailKind::DownstreamWrite: {
+    const auto finishing = st.finishing.find(conn_id_);
+    if (finishing != st.finishing.end()) {
+      active_ = finishing->second.sampled;
+      break;
+    }
+    const auto binding = st.bindings.find(conn_id_);
+    active_ = binding != st.bindings.end() && binding->second.sampled;
+    break;
+  }
+  }
+  if (active_) {
+    previous_ = active_io_detail;
+    active_io_detail = this;
+  }
+}
+
+ScopedIoDetail::~ScopedIoDetail() {
+  if (!active_) {
+    return;
+  }
+  active_io_detail = previous_;
+
+  IoDetailMetrics detail{prepare_ns_, syscall_ns_, commit_ns_,    calls_,  bytes_,
+                         capacity_,   items_,      unused_items_, eagain_, partial_};
+  if (detail.empty()) {
+    return;
+  }
+
+  auto& st = tls();
+  if (kind_ == IoDetailKind::DownstreamRead) {
+    ConnSlots& slots = st.slots[conn_id_];
+    slots.io_detail.add(detail);
+    slots.io_detail_mono = last_mono_ns_;
+    return;
+  }
+
+  const Binding* binding = nullptr;
+  if (kind_ == IoDetailKind::DownstreamWrite) {
+    auto finishing = st.finishing.find(conn_id_);
+    if (finishing != st.finishing.end()) {
+      binding = &finishing->second;
+    }
+  }
+  if (binding == nullptr) {
+    auto bound = st.bindings.find(conn_id_);
+    if (bound != st.bindings.end()) {
+      binding = &bound->second;
+    }
+  }
+  if (binding == nullptr || binding->trace == nullptr || !binding->sampled) {
+    return;
+  }
+
+  absl::string_view point;
+  switch (kind_) {
+  case IoDetailKind::UpstreamRead:
+    point = "up_read_io_detail";
+    break;
+  case IoDetailKind::UpstreamWrite:
+    point = "up_write_io_detail";
+    break;
+  case IoDetailKind::DownstreamWrite:
+    point = "dn_write_io_detail";
+    break;
+  case IoDetailKind::DownstreamRead:
+    return;
+  }
+  const int64_t mono = last_mono_ns_;
+  Event event{binding->trace, point, mono, binding->base_wall + (mono - binding->base_mono),
+              binding->seq_id};
+  event.has_io_detail = true;
+  event.io_detail = detail;
+  push(st, std::move(event));
+}
+
+ScopedIoDetailPhase::ScopedIoDetailPhase(IoDetailPhase phase)
+    : detail_(active_io_detail), phase_(phase) {
+  if (detail_ != nullptr) {
+    start_ns_ = monoNs(detail_->time_source_.monotonicTime());
+  }
+}
+
+ScopedIoDetailPhase::~ScopedIoDetailPhase() { finish(); }
+
+void ScopedIoDetailPhase::finish() {
+  if (detail_ == nullptr) {
+    return;
+  }
+  const int64_t end_ns = monoNs(detail_->time_source_.monotonicTime());
+  const uint64_t elapsed = end_ns >= start_ns_ ? static_cast<uint64_t>(end_ns - start_ns_) : 0;
+  detail_->last_mono_ns_ = end_ns;
+  switch (phase_) {
+  case IoDetailPhase::Prepare:
+    detail_->prepare_ns_ += elapsed;
+    break;
+  case IoDetailPhase::Syscall:
+    detail_->syscall_ns_ += elapsed;
+    break;
+  case IoDetailPhase::Commit:
+    detail_->commit_ns_ += elapsed;
+    break;
+  }
+  detail_ = nullptr;
+}
+
+void recordIoCall(uint64_t bytes, uint64_t capacity, uint64_t items, uint64_t unused_items,
+                  bool eagain) {
+  if (active_io_detail == nullptr) {
+    return;
+  }
+  ++active_io_detail->calls_;
+  active_io_detail->bytes_ += bytes;
+  active_io_detail->capacity_ += capacity;
+  active_io_detail->items_ += items;
+  active_io_detail->unused_items_ += unused_items;
+  active_io_detail->eagain_ += eagain ? 1 : 0;
+  if (bytes > 0 && capacity > 0 && bytes < capacity) {
+    ++active_io_detail->partial_;
+  }
+}
+
 void connEvent(uint64_t conn_id, absl::string_view point, MonotonicTime mono, SystemTime wall) {
   if (!config().enabled) {
     return;
@@ -408,6 +609,14 @@ void bindTrace(uint64_t conn_id, int32_t seq_id, absl::string_view traceparent, 
       emit(s.epoll_wake, absl::string_view("dn_epoll_wake"));
       emit(s.readv_start, absl::string_view("dn_readv_start"));
       emit(s.readv_done, absl::string_view("dn_readv_done"));
+      if (!s.io_detail.empty()) {
+        const int64_t detail_mono = s.io_detail_mono != 0 ? s.io_detail_mono : b.base_mono;
+        Event event{b.trace, absl::string_view("dn_read_io_detail"), detail_mono,
+                    b.base_wall + (detail_mono - b.base_mono), seq_id};
+        event.has_io_detail = true;
+        event.io_detail = s.io_detail;
+        push(st, std::move(event));
+      }
     }
   }
 

@@ -70,6 +70,67 @@ enum class Slot { DnEpollWake, DnReadvStart, DnReadvDone };
 void connSlot(uint64_t conn_id, Slot which, MonotonicTime mono);
 
 /**
+ * Minimal breakdown for one socket drain/fill operation.
+ *
+ * ConnectionImpl creates this scope only when the existing Kitex probe is active. Lower layers then
+ * add time to three deliberately broad buckets: preparing buffers/iovecs, executing the real I/O
+ * API, and committing or draining buffers. Repeated readv/writev calls are accumulated instead of
+ * emitting one event per call.
+ */
+enum class IoDetailKind { DownstreamRead, UpstreamRead, UpstreamWrite, DownstreamWrite };
+enum class IoDetailPhase { Prepare, Syscall, Commit };
+
+class ScopedIoDetail {
+public:
+  ScopedIoDetail(uint64_t conn_id, IoDetailKind kind, TimeSource& time_source);
+  ~ScopedIoDetail();
+
+  ScopedIoDetail(const ScopedIoDetail&) = delete;
+  ScopedIoDetail& operator=(const ScopedIoDetail&) = delete;
+
+private:
+  friend class ScopedIoDetailPhase;
+  friend void recordIoCall(uint64_t, uint64_t, uint64_t, uint64_t, bool);
+
+  uint64_t conn_id_;
+  IoDetailKind kind_;
+  TimeSource& time_source_;
+  ScopedIoDetail* previous_{nullptr};
+  int64_t last_mono_ns_{0};
+  uint64_t prepare_ns_{0};
+  uint64_t syscall_ns_{0};
+  uint64_t commit_ns_{0};
+  uint64_t calls_{0};
+  uint64_t bytes_{0};
+  uint64_t capacity_{0};
+  uint64_t items_{0};
+  uint64_t unused_items_{0};
+  uint64_t eagain_{0};
+  uint64_t partial_{0};
+  bool active_{false};
+};
+
+class ScopedIoDetailPhase {
+public:
+  explicit ScopedIoDetailPhase(IoDetailPhase phase);
+  ~ScopedIoDetailPhase();
+
+  void finish();
+
+  ScopedIoDetailPhase(const ScopedIoDetailPhase&) = delete;
+  ScopedIoDetailPhase& operator=(const ScopedIoDetailPhase&) = delete;
+
+private:
+  ScopedIoDetail* detail_{nullptr};
+  IoDetailPhase phase_;
+  int64_t start_ns_{0};
+};
+
+/** Record one real readv/writev/send/recv/UBSocket API call in the active I/O detail scope. */
+void recordIoCall(uint64_t bytes, uint64_t capacity, uint64_t items, uint64_t unused_items,
+                  bool eagain);
+
+/**
  * 记录一个 RPC 级事件。内部先查采样状态，未采样立即返回。
  *
  * 只取单调时钟。wall clock 由 bindTrace 时记下的基准点加上 mono 差值推算 ——
@@ -149,36 +210,70 @@ Stats stats();
 #if KITEX_PROBE_ENABLED
 
 #define KITEX_PROBE_CONN(conn_id, point, time_source)                                              \
-  ::Envoy::KitexProbe::connEvent((conn_id), (point), (time_source).monotonicTime(),                \
-                                 (time_source).systemTime())
+  do {                                                                                             \
+    if (::Envoy::KitexProbe::enabled()) {                                                          \
+      ::Envoy::KitexProbe::connEvent((conn_id), (point), (time_source).monotonicTime(),            \
+                                     (time_source).systemTime());                                  \
+    }                                                                                              \
+  } while (0)
 
 #define KITEX_PROBE_BIND(conn_id, seq_id, traceparent, time_source)                                \
-  ::Envoy::KitexProbe::bindTrace((conn_id), (seq_id), (traceparent),                               \
-                                 (time_source).monotonicTime(), (time_source).systemTime())
+  do {                                                                                             \
+    if (::Envoy::KitexProbe::enabled()) {                                                          \
+      ::Envoy::KitexProbe::bindTrace((conn_id), (seq_id), (traceparent),                           \
+                                     (time_source).monotonicTime(), (time_source).systemTime());   \
+    }                                                                                              \
+  } while (0)
 
 #define KITEX_PROBE(conn_id, point, time_source)                                                   \
-  ::Envoy::KitexProbe::rpcEvent((conn_id), (point), (time_source).monotonicTime())
+  do {                                                                                             \
+    if (::Envoy::KitexProbe::enabled()) {                                                          \
+      ::Envoy::KitexProbe::rpcEvent((conn_id), (point), (time_source).monotonicTime());            \
+    }                                                                                              \
+  } while (0)
 
 #define KITEX_PROBE_IF_SAMPLED(conn_id, point, time_source)                                        \
-  ::Envoy::KitexProbe::rpcEventIfSampled((conn_id), (point), (time_source))
+  do {                                                                                             \
+    if (::Envoy::KitexProbe::enabled()) {                                                          \
+      ::Envoy::KitexProbe::rpcEventIfSampled((conn_id), (point), (time_source));                   \
+    }                                                                                              \
+  } while (0)
 
-#define KITEX_PROBE_END(conn_id) ::Envoy::KitexProbe::endRpc((conn_id))
+#define KITEX_PROBE_END(conn_id)                                                                   \
+  do {                                                                                             \
+    if (::Envoy::KitexProbe::enabled()) {                                                          \
+      ::Envoy::KitexProbe::endRpc((conn_id));                                                      \
+    }                                                                                              \
+  } while (0)
 
 #define KITEX_PROBE_SAMPLED(conn_id) ::Envoy::KitexProbe::isSampled((conn_id))
 
 // 记录 RPC 尾部（响应已入队、writev 稍后执行）的点位。
 #define KITEX_PROBE_TAIL(conn_id, point, time_source, last)                                        \
-  ::Envoy::KitexProbe::rpcEventTail((conn_id), (point), (time_source).monotonicTime(), (last))
+  do {                                                                                             \
+    if (::Envoy::KitexProbe::enabled()) {                                                          \
+      ::Envoy::KitexProbe::rpcEventTail((conn_id), (point), (time_source).monotonicTime(),         \
+                                        (last));                                                   \
+    }                                                                                              \
+  } while (0)
 
 // 记录一个**已经采好**的时刻，而不是「现在」。
 // 用于时刻来自别处的场景，例如 epoll 返回的时间由 libevent 的 check 回调
 // 提前记下（Envoy 的 approximateMonotonicTime），到 onFileEvent 里再补记。
 #define KITEX_PROBE_AT(conn_id, point, mono)                                                       \
-  ::Envoy::KitexProbe::rpcEvent((conn_id), (point), (mono))
+  do {                                                                                             \
+    if (::Envoy::KitexProbe::enabled()) {                                                          \
+      ::Envoy::KitexProbe::rpcEvent((conn_id), (point), (mono));                                   \
+    }                                                                                              \
+  } while (0)
 
 // 写下游读路径的时间戳槽位。与 KITEX_PROBE_AT 一样接受「已经采好的时刻」。
 #define KITEX_PROBE_SLOT(conn_id, slot, mono)                                                      \
-  ::Envoy::KitexProbe::connSlot((conn_id), ::Envoy::KitexProbe::Slot::slot, (mono))
+  do {                                                                                             \
+    if (::Envoy::KitexProbe::enabled()) {                                                          \
+      ::Envoy::KitexProbe::connSlot((conn_id), ::Envoy::KitexProbe::Slot::slot, (mono));           \
+    }                                                                                              \
+  } while (0)
 
 #else
 
