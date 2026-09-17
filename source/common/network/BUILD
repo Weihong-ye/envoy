@@ -294,6 +294,7 @@ envoy_cc_library(
         "//source/common/api:os_sys_calls_lib",
         "//source/common/buffer:buffer_lib",
         "//source/common/event:dispatcher_includes",
+        "//source/common/kitex_probe:kitex_probe_lib",
         "@envoy_api//envoy/extensions/network/socket_interface/v3:pkg_cc_proto",
         "@quiche//:quic_platform_socket_address",
     ] + select({
