@@ -184,6 +184,7 @@ public:
   // 常开的文件句柄。每次 writeOut 都 fopen/fclose 的话，
   // 在高 QPS 下 open 系统调用本身就会成为可观的开销。
   FILE* fp{nullptr};
+  bool schema_written{false};
 };
 
 ThreadState& tls() {
@@ -287,6 +288,13 @@ void writeOut(ThreadState& st, std::vector<Event>& events) {
   if (f == nullptr) {
     events.clear();
     return;
+  }
+  if (!st.schema_written) {
+    absl::FPrintF(f,
+                  R"({"type":"meta","schema":"envoy-kitex-probe-v2","host":"%s","node":"%s"})"
+                  "\n",
+                  cfg.host, cfg.node);
+    st.schema_written = true;
   }
   for (const auto& e : events) {
     // 字段与 Kitex 侧 probe 包保持一致，merge 工具才能统一处理。

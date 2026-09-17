@@ -314,6 +314,8 @@ void ConnectionManager::ResponseDecoder::finalizeResponse() {
       NamedTransportConfigFactory::getFactory(cm.decoder_->transportType()).createTransport();
 
   metadata_->setProtocol(cm.decoder_->protocolType());
+  KITEX_PROBE_IF_SAMPLED(cm.read_callbacks_->connection().id(), "dn_frame_encode_start",
+                         parent_.parent_.time_source_);
   transport->encodeFrame(buffer, *metadata_, parent_.response_buffer_);
   // 下游响应帧编码完成。与上游侧的 up_encode_done 对称，把「编码」与「写 socket」
   // 分开 —— 合在一起的话分不清是序列化慢还是 socket 慢。
