@@ -10,6 +10,7 @@
 #include "source/common/common/safe_memcpy.h"
 #include "source/common/common/utility.h"
 #include "source/common/event/file_event_impl.h"
+#include "source/common/kitex_probe/probe.h"
 #include "source/common/network/address_impl.h"
 #include "source/common/network/socket_interface_impl.h"
 
@@ -72,6 +73,7 @@ Api::IoCallUint64Result IoSocketHandleImpl::close() {
 
 Api::IoCallUint64Result IoSocketHandleImpl::readv(uint64_t max_length, Buffer::RawSlice* slices,
                                                   uint64_t num_slice) {
+  KitexProbe::ScopedIoDetailPhase prepare(KitexProbe::IoDetailPhase::Prepare);
   absl::FixedArray<iovec> iov(num_slice);
   uint64_t num_slices_to_read = 0;
   uint64_t num_bytes_to_read = 0;
@@ -83,15 +85,20 @@ Api::IoCallUint64Result IoSocketHandleImpl::readv(uint64_t max_length, Buffer::R
     num_bytes_to_read += slice_length;
   }
   ASSERT(num_bytes_to_read <= max_length);
+  prepare.finish();
 
-  if (num_slices_to_read == 1) {
-    // Avoid paying the VFS overhead when there is only one IO buffer to work with
-    return sysCallResultToIoCallResult(
-        Api::OsSysCallsSingleton::get().recv(fd_, iov[0].iov_base, iov[0].iov_len, 0));
-  }
-
-  auto result = sysCallResultToIoCallResult(Api::OsSysCallsSingleton::get().readv(
-      fd_, iov.begin(), static_cast<int>(num_slices_to_read)));
+  Api::IoCallUint64Result result = [&]() -> Api::IoCallUint64Result {
+    KitexProbe::ScopedIoDetailPhase syscall(KitexProbe::IoDetailPhase::Syscall);
+    if (num_slices_to_read == 1) {
+      // Avoid paying the VFS overhead when there is only one IO buffer to work with
+      return sysCallResultToIoCallResult(
+          Api::OsSysCallsSingleton::get().recv(fd_, iov[0].iov_base, iov[0].iov_len, 0));
+    }
+    return sysCallResultToIoCallResult(Api::OsSysCallsSingleton::get().readv(
+        fd_, iov.begin(), static_cast<int>(num_slices_to_read)));
+  }();
+  KitexProbe::recordIoCall(result.ok() ? result.return_value_ : 0, num_bytes_to_read,
+                           num_slices_to_read, 0, result.wouldBlock());
   return result;
 }
 
@@ -101,46 +108,61 @@ Api::IoCallUint64Result IoSocketHandleImpl::read(Buffer::Instance& buffer,
   if (max_length == 0) {
     return Api::ioCallUint64ResultNoError();
   }
+  KitexProbe::ScopedIoDetailPhase prepare(KitexProbe::IoDetailPhase::Prepare);
   Buffer::Reservation reservation = buffer.reserveForRead();
+  prepare.finish();
   Api::IoCallUint64Result result = readv(std::min(reservation.length(), max_length),
                                          reservation.slices(), reservation.numSlices());
   uint64_t bytes_to_commit = result.ok() ? result.return_value_ : 0;
   ASSERT(bytes_to_commit <= max_length);
+  KitexProbe::ScopedIoDetailPhase commit(KitexProbe::IoDetailPhase::Commit);
   reservation.commit(bytes_to_commit);
+  commit.finish();
   return result;
 }
 
 Api::IoCallUint64Result IoSocketHandleImpl::writev(const Buffer::RawSlice* slices,
                                                    uint64_t num_slice) {
+  KitexProbe::ScopedIoDetailPhase prepare(KitexProbe::IoDetailPhase::Prepare);
   absl::FixedArray<iovec> iov(num_slice);
   uint64_t num_slices_to_write = 0;
+  uint64_t num_bytes_to_write = 0;
   for (uint64_t i = 0; i < num_slice; i++) {
     if (slices[i].mem_ != nullptr && slices[i].len_ != 0) {
       iov[num_slices_to_write].iov_base = slices[i].mem_;
       iov[num_slices_to_write].iov_len = slices[i].len_;
+      num_bytes_to_write += slices[i].len_;
       num_slices_to_write++;
     }
   }
+  prepare.finish();
   if (num_slices_to_write == 0) {
     return Api::ioCallUint64ResultNoError();
   }
 
-  if (num_slices_to_write == 1) {
-    // Avoid paying the VFS overhead when there is only one IO buffer to work with
+  Api::IoCallUint64Result result = [&]() -> Api::IoCallUint64Result {
+    KitexProbe::ScopedIoDetailPhase syscall(KitexProbe::IoDetailPhase::Syscall);
+    if (num_slices_to_write == 1) {
+      // Avoid paying the VFS overhead when there is only one IO buffer to work with
+      return sysCallResultToIoCallResult(
+          Api::OsSysCallsSingleton::get().send(fd_, iov[0].iov_base, iov[0].iov_len, 0));
+    }
     return sysCallResultToIoCallResult(
-        Api::OsSysCallsSingleton::get().send(fd_, iov[0].iov_base, iov[0].iov_len, 0));
-  }
-
-  auto result = sysCallResultToIoCallResult(
-      Api::OsSysCallsSingleton::get().writev(fd_, iov.begin(), num_slices_to_write));
+        Api::OsSysCallsSingleton::get().writev(fd_, iov.begin(), num_slices_to_write));
+  }();
+  KitexProbe::recordIoCall(result.ok() ? result.return_value_ : 0, num_bytes_to_write,
+                           num_slices_to_write, 0, result.wouldBlock());
   return result;
 }
 
 Api::IoCallUint64Result IoSocketHandleImpl::write(Buffer::Instance& buffer) {
   constexpr uint64_t MaxSlices = 16;
+  KitexProbe::ScopedIoDetailPhase prepare(KitexProbe::IoDetailPhase::Prepare);
   Buffer::RawSliceVector slices = buffer.getRawSlices(MaxSlices);
+  prepare.finish();
   Api::IoCallUint64Result result = writev(slices.begin(), slices.size());
   if (result.ok() && result.return_value_ > 0) {
+    KitexProbe::ScopedIoDetailPhase commit(KitexProbe::IoDetailPhase::Commit);
     buffer.drain(static_cast<uint64_t>(result.return_value_));
   }
   return result;
