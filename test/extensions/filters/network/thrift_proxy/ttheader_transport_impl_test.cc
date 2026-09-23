@@ -1,6 +1,7 @@
 #include "envoy/common/exception.h"
 
 #include "source/common/buffer/buffer_impl.h"
+#include "source/extensions/filters/network/thrift_proxy/binary_protocol_impl.h"
 #include "source/extensions/filters/network/thrift_proxy/ttheader_transport_impl.h"
 
 #include "test/extensions/filters/network/thrift_proxy/ttheader_fixtures.h"
@@ -121,6 +122,69 @@ TEST_F(TTHeaderTransportTest, EncodeFramePropagatesOutputSliceFactoryToHeader) {
   // One external slice is allocated for the fixed frame prefix and one for the encoded header.
   EXPECT_EQ(2, allocations);
   EXPECT_EQ(0, message.length());
+}
+
+TEST_F(TTHeaderTransportTest, ControlledSmallHeadersPreserveWireAndPayload) {
+  for (bool framed : {false, true}) {
+    SCOPED_TRACE(framed);
+    MessageMetadata metadata(true);
+    metadata.setProtocol(ProtocolType::Binary);
+    metadata.setMethodName("echo");
+    metadata.setMessageType(MessageType::Call);
+    metadata.setSequenceId(7);
+    metadata.requestHeaders().addCopy(TTHeaderIntKeyNames::get().ToService, "svc");
+    if (framed) {
+      metadata.requestHeaders().addCopy(TTHeaderTransportImpl::framedPayloadMarker(), "1");
+    }
+    BinaryProtocolImpl protocol;
+    const std::string payload(4096, 'b');
+    Buffer::OwnedImpl reference_message;
+    protocol.writeMessageBegin(reference_message, metadata);
+    reference_message.add(payload);
+    Buffer::OwnedImpl reference;
+    transport_.encodeFrame(reference, metadata, reference_message);
+
+    uint64_t allocations = 0;
+    uint64_t releases = 0;
+    uint64_t payload_releases = 0;
+    // Model a controlled output domain without depending on the network UB runtime.
+    // The UB handle test separately verifies that its real output factory opts into this contract.
+    Buffer::OwnedImpl::SliceFactory factory = [&](uint64_t, uint32_t, void* context,
+                                                  Buffer::OwnedImpl::SliceConsumer consume) {
+      constexpr uint64_t Capacity = 65504;
+      auto* storage = new uint8_t[Capacity];
+      ++allocations;
+      consume(context, Buffer::Slice(
+                           storage, Capacity,
+                           [&, storage] {
+                             ++releases;
+                             delete[] storage;
+                           },
+                           &allocations));
+    };
+    Buffer::OwnedImpl message(factory);
+    protocol.writeMessageBegin(message, metadata);
+    message.addExternalSlice(Buffer::Slice(static_cast<const void*>(payload.data()), payload.size(),
+                                           [&] { ++payload_releases; }));
+    Buffer::OwnedImpl output(factory);
+    transport_.encodeFrame(output, metadata, message);
+    EXPECT_EQ(reference.toString(), output.toString());
+    EXPECT_EQ(0, message.length());
+    const auto slices = output.getRawSlices();
+    ASSERT_EQ(2, slices.size());
+    EXPECT_EQ(payload.data(), slices[1].mem_);
+    EXPECT_EQ(payload.size(), slices[1].len_);
+    EXPECT_EQ(3, allocations);
+    EXPECT_EQ(2, releases);
+    EXPECT_EQ(0, payload_releases);
+    output.drain(7);
+    EXPECT_EQ(2, releases);
+    output.drain(slices[0].len_ - 7);
+    EXPECT_EQ(3, releases);
+    EXPECT_EQ(0, payload_releases);
+    output.drain(payload.size());
+    EXPECT_EQ(1, payload_releases);
+  }
 }
 
 TEST_F(TTHeaderTransportTest, RejectsApacheTHeaderMagic) {

@@ -134,12 +134,14 @@ public:
    * Create an empty mutable Slice backed by externally allocated storage.
    *
    * The releasor owns the storage lifetime. External mutable slices are appendable while they
-   * remain in a buffer, but are deliberately not coalesced during Buffer::move(), because doing so
-   * would copy hardware-owned storage into a destination heap slice.
+   * remain in a buffer. By default they are not coalesced during Buffer::move(). An optional domain
+   * explicitly permits small copies into mutable external slices in the same domain, never heap
+   * storage. The domain must outlive all of its slices; the owner must allow early source release.
    */
-  Slice(uint8_t* storage, uint64_t capacity, Releasor releasor)
+  Slice(uint8_t* storage, uint64_t capacity, Releasor releasor,
+        const void* coalesce_domain = nullptr)
       : capacity_(capacity), base_(storage), releasor_(std::move(releasor)),
-        mutable_external_(true) {
+        mutable_external_(true), coalesce_domain_(coalesce_domain) {
     ASSERT(storage != nullptr);
     ASSERT(capacity != 0);
     ASSERT(releasor_ != nullptr);
@@ -172,6 +174,7 @@ public:
     drain_trackers_ = std::move(rhs.drain_trackers_);
     account_ = std::move(rhs.account_);
     mutable_external_ = rhs.mutable_external_;
+    coalesce_domain_ = rhs.coalesce_domain_;
     releasor_.swap(rhs.releasor_);
 
     rhs.capacity_ = 0;
@@ -179,6 +182,7 @@ public:
     rhs.data_ = 0;
     rhs.reservable_ = 0;
     rhs.mutable_external_ = false;
+    rhs.coalesce_domain_ = nullptr;
   }
 
   Slice& operator=(Slice&& rhs) noexcept {
@@ -193,6 +197,7 @@ public:
       drain_trackers_ = std::move(rhs.drain_trackers_);
       account_ = std::move(rhs.account_);
       mutable_external_ = rhs.mutable_external_;
+      coalesce_domain_ = rhs.coalesce_domain_;
       if (releasor_) {
         releasor_();
       }
@@ -204,6 +209,7 @@ public:
       rhs.data_ = 0;
       rhs.reservable_ = 0;
       rhs.mutable_external_ = false;
+      rhs.coalesce_domain_ = nullptr;
     }
 
     return *this;
@@ -225,6 +231,11 @@ public:
    * @return true if content in this Slice can be coalesced into another Slice.
    */
   bool canCoalesce() const { return storage_ != nullptr; }
+
+  bool canCoalesceInto(const Slice& destination) const {
+    return canCoalesce() || (coalesce_domain_ != nullptr && destination.mutable_external_ &&
+                             coalesce_domain_ == destination.coalesce_domain_);
+  }
 
   /**
    * @return a pointer to the start of the usable content.
@@ -471,6 +482,9 @@ protected:
 
   /** Whether externally owned storage is mutable. */
   bool mutable_external_{false};
+
+  // Only explicitly opted-in mutable storage may be coalesced within this ownership domain.
+  const void* coalesce_domain_{nullptr};
 };
 
 class OwnedImpl;

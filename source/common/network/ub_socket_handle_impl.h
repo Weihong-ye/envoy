@@ -19,8 +19,7 @@ constexpr int UbsocketAddressFamily = 43;
 
 namespace Ubsocket {
 
-// PR9 exposes its zero-copy data path through the brpc-compatible block ABI. Keep this layout in
-// sync with ock::ubs::Block and ub_bench_epoll_zc.cpp.
+// TX allocation layout, checked against the provider's capability response. RX owners are opaque.
 struct Block {
   std::atomic<int> nshared;
   uint16_t flags;
@@ -39,24 +38,54 @@ static_assert(sizeof(Block) == 32, "UBSocket block ABI changed");
 // be selected independently at process start.
 constexpr size_t ReadBudgetBlockSize = 8 * 1024;
 constexpr size_t ReadBudgetPayloadCapacity = ReadBudgetBlockSize - sizeof(Block);
-constexpr size_t DefaultBlockSize = 16 * 1024;
+constexpr size_t DefaultBlockSize = 64 * 1024;
 constexpr uint16_t BlockFlagsUb = 1U << 2;
 static_assert(ReadBudgetPayloadCapacity == 8160, "UBSocket UDS read budget changed");
 
+struct Capabilities {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t block_size;
+  uint32_t block_header_size;
+  uint32_t max_batch_size;
+  uint32_t reserved;
+  uint64_t feature_flags;
+};
+
+struct Segment {
+  const void* data;
+  size_t length;
+  void* owner;
+};
+
+// Construct before dispatchers; destroy after all workers, sockets and external slices.
+class Runtime {
+public:
+  Runtime();
+  ~Runtime();
+  Runtime(const Runtime&) = delete;
+  Runtime& operator=(const Runtime&) = delete;
+
+private:
+  void (*uninit_)() = nullptr;
+};
+
 class Api {
 public:
-  using ReadvFn = ssize_t (*)(int, const struct iovec*, int);
+  using ReadvFn = ssize_t (*)(int, Segment*, uint32_t, size_t);
+  using ReleaseFn = void (*)(void*);
   using WritevFn = ssize_t (*)(int, const struct iovec*, int);
   using IobufAllocateBatchFn = int (*)(size_t, void**, uint32_t);
   using IobufDeallocateBatchFn = void (*)(void* const*, uint32_t);
 
   static const Api& instance();
 
-  bool available() const { return available_; }
+  bool available() const { return available_ && blockSize() != 0; }
   size_t blockSize() const;
   size_t blockPayloadCapacity() const;
 
   const ReadvFn readv_;
+  const ReleaseFn release_;
   const WritevFn writev_;
   const IobufAllocateBatchFn iobuf_allocate_batch_;
   const IobufDeallocateBatchFn iobuf_deallocate_batch_;
@@ -69,6 +98,7 @@ private:
 
 // Reuse UBSocket's transport mode so the same binary keeps ordinary socket behavior in TCP mode.
 bool zeroCopyEnabled();
+bool transportEnabled();
 
 // Process transport mode is cached after its first observation. Tests that mutate the environment
 // use this hook between observations; production code must not change transport mode after startup.
@@ -84,10 +114,10 @@ Buffer::OwnedImpl::SliceFactory createOutputSliceFactory(bool ub_destination = t
 } // namespace Ubsocket
 
 /**
- * Stream socket handle for the original PR9 UBSocket zero-copy ABI.
+ * Stream socket handle for the versioned UBSocket v2 segment ABI.
  *
- * RX attaches UBSocket-owned blocks to Envoy as BufferFragments. TX passes UB-backed Envoy slices
- * to the direct ubsocket_writev entry point. The selected Thrift path must take over ordinary
+ * RX attaches bounded segments with opaque owners. TX passes UB-backed Envoy slices
+ * to the direct ubsocket_writev_zc entry point. The selected Thrift path must take over ordinary
  * memory before it reaches this handle. Any missing symbol or UBSocket TCP fallback is returned as
  * an error instead of silently using a POSIX path.
  */
@@ -95,12 +125,21 @@ class UbSocketHandleImpl final : public IoSocketHandleImpl {
 public:
   explicit UbSocketHandleImpl(os_fd_t fd = INVALID_SOCKET, bool socket_v6only = false,
                               std::optional<int> domain = std::nullopt,
-                              size_t address_cache_max_capacity = 0)
-      : IoSocketHandleImpl(fd, socket_v6only, domain, address_cache_max_capacity) {}
+                              size_t address_cache_max_capacity = 0, int creation_error = 0)
+      : IoSocketHandleImpl(fd, socket_v6only, domain, address_cache_max_capacity),
+        creation_error_(creation_error) {}
+
+  Api::SysCallIntResult bind(Address::InstanceConstSharedPtr address) override;
+  Api::SysCallIntResult connect(Address::InstanceConstSharedPtr address) override;
+  Api::SysCallIntResult listen(int backlog) override;
+  IoHandlePtr duplicate() override;
 
   Api::IoCallUint64Result read(Buffer::Instance& buffer,
                                std::optional<uint64_t> max_length) override;
   Api::IoCallUint64Result writev(const Buffer::RawSlice* slices, uint64_t num_slice) override;
+
+private:
+  const int creation_error_;
 };
 
 /**

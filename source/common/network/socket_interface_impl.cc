@@ -158,17 +158,31 @@ IoHandlePtr SocketInterfaceImpl::socket(Socket::Type socket_type,
   const bool use_ubsocket =
       socket_type == Socket::Type::Stream && addr->type() == Address::Type::Ip &&
       ip_version == Address::IpVersion::v4 &&
-      isConfiguredUbIpv4Address(addr->ip()->ipv4()->address()) && Ubsocket::zeroCopyEnabled();
+      isConfiguredUbIpv4Address(addr->ip()->ipv4()->address()) && Ubsocket::transportEnabled();
 
   IoHandlePtr io_handle;
   if (use_ubsocket) {
     const int flags = SOCK_NONBLOCK | SOCK_STREAM;
     const Api::SysCallSocketResult result =
-        Api::OsSysCallsSingleton::get().socket(UbsocketAddressFamily, flags, 0);
-    RELEASE_ASSERT(SOCKET_VALID(result.return_value_),
-                   fmt::format("socket(AF_SMC) failed: {}", errorDetails(result.errno_)));
-    io_handle =
-        makeSocket(result.return_value_, v6only, socket_type, UbsocketAddressFamily, options);
+        Ubsocket::zeroCopyEnabled()
+            ? Api::OsSysCallsSingleton::get().socket(UbsocketAddressFamily, flags, 0)
+            : Api::SysCallSocketResult{INVALID_SOCKET, ENODEV};
+    if (SOCKET_VALID(result.return_value_)) {
+      io_handle =
+          makeSocket(result.return_value_, v6only, socket_type, UbsocketAddressFamily, options);
+    } else {
+      ENVOY_LOG_MISC(error, "Selected UB socket unavailable: {}", errorDetails(result.errno_));
+      // Envoy expects a live descriptor during socket setup. This descriptor only carries the
+      // creation error: bind/connect/listen and data operations reject it, so no TCP connection
+      // can be made. Ordinary unselected sockets remain usable after provider initialization fails.
+      const auto placeholder =
+          Api::OsSysCallsSingleton::get().socket(AF_INET, flags | SOCK_CLOEXEC, 0);
+      if (!SOCKET_VALID(placeholder.return_value_)) {
+        return nullptr;
+      }
+      io_handle = std::make_unique<UbSocketHandleImpl>(placeholder.return_value_, false,
+                                                       UbsocketAddressFamily, 0, result.errno_);
+    }
   } else {
     io_handle = SocketInterfaceImpl::socket(socket_type, addr->type(), ip_version, v6only, options);
   }

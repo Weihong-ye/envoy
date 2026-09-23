@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -32,6 +33,7 @@ struct FakeUbsocketState {
   std::string written;
   int read_error{0};
   int write_error{0};
+  size_t write_limit{std::numeric_limits<size_t>::max()};
   int alloc_calls{0};
   int dealloc_calls{0};
   int batch_alloc_calls{0};
@@ -39,7 +41,13 @@ struct FakeUbsocketState {
   bool fail_alloc{false};
   int last_write_iovcnt{0};
   std::vector<void*> last_write_iov_bases;
-  size_t block_size{Ubsocket::ReadBudgetBlockSize};
+  size_t block_size{Ubsocket::DefaultBlockSize};
+  uint32_t abi_version{1};
+  uint64_t feature_flags{31};
+  uint32_t max_batch_size{64};
+  int query_calls{0};
+  size_t rx_chunk_index{0};
+  size_t rx_chunk_offset{0};
 };
 
 FakeUbsocketState* fake_ubsocket_state;
@@ -84,7 +92,6 @@ protected:
     for (void* allocation : state_.allocations) {
       ::operator delete[](allocation);
     }
-    fake_ubsocket_state = nullptr;
     size_t index = 0;
     for (const char* name : {"UBSOCKET_BLOCK_TYPE", "UBSOCKET_UB_TRANS_MODE"}) {
       const auto& value = original_layout_env_[index++];
@@ -94,7 +101,7 @@ protected:
         TestEnvironment::unsetEnvVar(name);
       }
     }
-    Ubsocket::resetBlockLayoutForTest();
+    fake_ubsocket_state = nullptr;
     if (original_transport_mode_.has_value()) {
       TestEnvironment::setEnvVar("UBSOCKET_TRANS_MODE", *original_transport_mode_, true);
     } else {
@@ -107,6 +114,8 @@ protected:
     ASSERT_TRUE(state_.allocations.empty());
     TestEnvironment::setEnvVar("UBSOCKET_BLOCK_TYPE", setting, true);
     state_.block_size = size;
+    state_.rx_chunk_index = 0;
+    state_.rx_chunk_offset = 0;
     Ubsocket::resetBlockLayoutForTest();
   }
 
@@ -115,41 +124,60 @@ protected:
   std::vector<std::optional<std::string>> original_layout_env_;
 };
 
-TEST_F(UbSocketHandleImplTest, RuntimeBlockAliasesMatchUbsocketAndAreCached) {
-  for (const auto& setting :
-       {std::pair<const char*, size_t>{"default", 16384}, {"8k", 8192}, {"16k", 16384}}) {
-    useBlockSize(setting.first, setting.second);
-    EXPECT_EQ(setting.second, Ubsocket::Api::instance().blockSize());
-    EXPECT_EQ(setting.second - sizeof(Ubsocket::Block),
-              Ubsocket::Api::instance().blockPayloadCapacity());
-    TestEnvironment::setEnvVar("UBSOCKET_BLOCK_TYPE", "invalid", true);
-    EXPECT_EQ(setting.second, Ubsocket::Api::instance().blockSize());
-  }
+TEST_F(UbSocketHandleImplTest, FailedCreationCannotBindConnectListenDuplicateOrWrite) {
+  const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  ASSERT_GE(fd, 0);
+  UbSocketHandleImpl handle(fd, false, UbsocketAddressFamily, 0, ENODEV);
+  EXPECT_TRUE(handle.isOpen());
+  EXPECT_EQ(ENODEV, handle.bind(nullptr).errno_);
+  EXPECT_EQ(ENODEV, handle.connect(nullptr).errno_);
+  EXPECT_EQ(ENODEV, handle.listen(16).errno_);
+  EXPECT_EQ(nullptr, handle.duplicate());
+  EXPECT_EQ(ENODEV, handle.writev(nullptr, 0).err_->getSystemErrorCode());
+  EXPECT_TRUE(state_.written.empty());
 }
 
-TEST_F(UbSocketHandleImplTest, UnsupportedLayoutAndMismatchedLibraryFailClosed) {
+TEST_F(UbSocketHandleImplTest, CapabilitiesAreQueriedOnceAndCached) {
+  useBlockSize("64k", 65536);
+  const int queries = state_.query_calls;
+  EXPECT_EQ(65536, Ubsocket::Api::instance().blockSize());
+  EXPECT_EQ(65504, Ubsocket::Api::instance().blockPayloadCapacity());
+  state_.block_size = 8192;
+  for (int i = 0; i < 100; ++i) {
+    EXPECT_TRUE(Ubsocket::Api::instance().available());
+    EXPECT_EQ(65536, Ubsocket::Api::instance().blockSize());
+  }
+  EXPECT_EQ(queries, state_.query_calls);
+}
+
+TEST_F(UbSocketHandleImplTest, UnsupportedCapabilitiesFailClosed) {
   Buffer::OwnedImpl buffer;
   UbSocketHandleImpl handle(42, false, UbsocketAddressFamily);
-  for (const char* invalid : {"4k", "32k", "64k", "large", "invalid", ""}) {
-    useBlockSize(invalid, 8192);
-    EXPECT_EQ(0, Ubsocket::Api::instance().blockPayloadCapacity());
+  for (const size_t size : {4096, 8192, 16384, 32768}) {
+    useBlockSize("ignored", size);
+    EXPECT_FALSE(Ubsocket::Api::instance().available());
     EXPECT_FALSE(handle.read(buffer, 1024).ok());
     EXPECT_EQ(0, state_.alloc_calls);
   }
-  useBlockSize("16k", 8192); // Simulate an old/mismatched library exposing 8K blocks.
-  EXPECT_FALSE(handle.read(buffer, 1024).ok());
-  EXPECT_TRUE(state_.allocations.empty());
-  TestEnvironment::setEnvVar("UBSOCKET_UB_TRANS_MODE", "RC_CTP", true);
+  state_.block_size = 65536;
+  state_.abi_version = 2;
   Ubsocket::resetBlockLayoutForTest();
-  EXPECT_EQ(0, Ubsocket::Api::instance().blockPayloadCapacity());
-  TestEnvironment::unsetEnvVar("UBSOCKET_UB_TRANS_MODE");
+  EXPECT_FALSE(Ubsocket::Api::instance().available());
+  state_.abi_version = 1;
+  for (uint64_t bit = 1; bit <= 16; bit <<= 1) {
+    state_.feature_flags = 31 & ~bit;
+    Ubsocket::resetBlockLayoutForTest();
+    EXPECT_FALSE(Ubsocket::Api::instance().available());
+  }
+  state_.feature_flags = 31;
+  state_.max_batch_size = 63;
   Ubsocket::resetBlockLayoutForTest();
-  EXPECT_EQ(0, Ubsocket::Api::instance().blockPayloadCapacity());
+  EXPECT_FALSE(Ubsocket::Api::instance().available());
 }
 
 TEST_F(UbSocketHandleImplTest, RuntimeOutputBoundariesPreserveBytesAndOutstandingTxReference) {
   TestEnvironment::setEnvVar("UBSOCKET_TRANS_MODE", "ub", true);
-  for (const auto& setting : {std::pair<const char*, size_t>{"8k", 8192}, {"16k", 16384}}) {
+  for (const auto& setting : {std::pair<const char*, size_t>{"64k", 65536}}) {
     useBlockSize(setting.first, setting.second);
     const size_t capacity = Ubsocket::Api::instance().blockPayloadCapacity();
     for (const size_t length :
@@ -179,7 +207,7 @@ TEST_F(UbSocketHandleImplTest, RuntimeOutputBoundariesPreserveBytesAndOutstandin
 }
 
 TEST_F(UbSocketHandleImplTest, RuntimeUnixReadsKeepBaselineByteBudgets) {
-  for (const auto& setting : {std::pair<const char*, size_t>{"8k", 8192}, {"16k", 16384}}) {
+  for (const auto& setting : {std::pair<const char*, size_t>{"64k", 65536}}) {
     SCOPED_TRACE(setting.first);
     useBlockSize(setting.first, setting.second);
     const size_t capacity = Ubsocket::Api::instance().blockPayloadCapacity();
@@ -211,7 +239,7 @@ TEST_F(UbSocketHandleImplTest, RuntimeUnixReadsKeepBaselineByteBudgets) {
 }
 
 TEST_F(UbSocketHandleImplTest, RuntimeRxChainsPassOriginalPayloadPointersToTx) {
-  for (const auto& setting : {std::pair<const char*, size_t>{"8k", 8192}, {"16k", 16384}}) {
+  for (const auto& setting : {std::pair<const char*, size_t>{"64k", 65536}}) {
     useBlockSize(setting.first, setting.second);
     const size_t capacity = Ubsocket::Api::instance().blockPayloadCapacity();
     state_.rx_chunks = {std::string(capacity, 'r'), std::string(capacity, 's'), "tail"};
@@ -235,7 +263,7 @@ TEST_F(UbSocketHandleImplTest, RuntimeRxChainsPassOriginalPayloadPointersToTx) {
 }
 
 TEST_F(UbSocketHandleImplTest, RuntimeUnixReadLimitAndShrinkPreserveByteBudgetLearning) {
-  for (const auto& setting : {std::pair<const char*, size_t>{"8k", 8192}, {"16k", 16384}}) {
+  for (const auto& setting : {std::pair<const char*, size_t>{"64k", 65536}}) {
     SCOPED_TRACE(setting.first);
     useBlockSize(setting.first, setting.second);
     int fds[2];
@@ -320,7 +348,7 @@ TEST_F(UbSocketHandleImplTest, OutputSliceFactoryFillsBlocksAndMovesWithoutCopyi
   TestEnvironment::setEnvVar("UBSOCKET_TRANS_MODE", "ub", true);
   Buffer::OwnedImpl buffer(Ubsocket::createOutputSliceFactory());
   const std::string first = "small thrift fields";
-  const std::string payload(2 * Ubsocket::ReadBudgetPayloadCapacity, 'p');
+  const std::string payload(2 * Ubsocket::Api::instance().blockPayloadCapacity(), 'p');
 
   buffer.add(first);
   buffer.add(payload);
@@ -329,8 +357,8 @@ TEST_F(UbSocketHandleImplTest, OutputSliceFactoryFillsBlocksAndMovesWithoutCopyi
   EXPECT_EQ(3, state_.alloc_calls);
   const Buffer::RawSliceVector before_move = buffer.getRawSlices();
   ASSERT_EQ(3, before_move.size());
-  EXPECT_EQ(Ubsocket::ReadBudgetPayloadCapacity, before_move[0].len_);
-  EXPECT_EQ(Ubsocket::ReadBudgetPayloadCapacity, before_move[1].len_);
+  EXPECT_EQ(Ubsocket::Api::instance().blockPayloadCapacity(), before_move[0].len_);
+  EXPECT_EQ(Ubsocket::Api::instance().blockPayloadCapacity(), before_move[1].len_);
   EXPECT_EQ(first.size(), before_move[2].len_);
 
   Buffer::OwnedImpl destination;
@@ -360,12 +388,73 @@ TEST_F(UbSocketHandleImplTest, OutputSliceAllocationFailsClosed) {
   EXPECT_TRUE(state_.allocations.empty());
 }
 
+TEST_F(UbSocketHandleImplTest, OutputSmallHeadersCoalesceWithoutCopyingPayload) {
+  TestEnvironment::setEnvVar("UBSOCKET_TRANS_MODE", "ub", true);
+  const std::string payload(4096, 'p');
+  int payload_released = 0;
+  int header_drained = 0;
+  Buffer::OwnedImpl output(Ubsocket::createOutputSliceFactory());
+  Buffer::OwnedImpl variable_header(Ubsocket::createOutputSliceFactory());
+  Buffer::OwnedImpl message(Ubsocket::createOutputSliceFactory());
+  output.add("fixed");
+  variable_header.add("variable");
+  message.add("message");
+  variable_header.addDrainTracker([&] { ++header_drained; });
+  auto* payload_block = makeBlock(payload);
+  const void* payload_address = payload_block->data;
+  message.addExternalSlice(Buffer::Slice(payload_address, payload.size(), [&] {
+    ++payload_released;
+    Ubsocket::Api::instance().release_(payload_block);
+  }));
+  output.move(variable_header);
+  output.move(message);
+  EXPECT_EQ("fixedvariablemessage" + payload, output.toString());
+  const auto slices = output.getRawSlices();
+  ASSERT_EQ(2, slices.size());
+  EXPECT_EQ(20, slices[0].len_);
+  EXPECT_EQ(payload_address, slices[1].mem_);
+  EXPECT_EQ(4, state_.alloc_calls);
+  EXPECT_EQ(2, state_.dealloc_calls);
+  EXPECT_EQ(0, header_drained);
+  EXPECT_EQ(0, payload_released);
+  const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  ASSERT_GE(fd, 0);
+  UbSocketHandleImpl handle(fd, false, UbsocketAddressFamily);
+  state_.write_limit = 7;
+  auto partial = handle.write(output);
+  ASSERT_TRUE(partial.ok());
+  EXPECT_EQ(7, partial.return_value_);
+  EXPECT_EQ(13 + payload.size(), output.length());
+  EXPECT_EQ(0, header_drained);
+  state_.write_error = EAGAIN;
+  auto retry = handle.write(output);
+  ASSERT_FALSE(retry.ok());
+  EXPECT_EQ(Api::IoError::IoErrorCode::Again, retry.err_->getErrorCode());
+  EXPECT_EQ(13 + payload.size(), output.length());
+  EXPECT_EQ(0, header_drained);
+  state_.write_error = 0;
+  state_.write_limit = 13;
+  ASSERT_TRUE(handle.write(output).ok());
+  EXPECT_EQ(1, header_drained);
+  EXPECT_EQ(3, state_.dealloc_calls);
+  EXPECT_EQ(0, payload_released);
+  state_.write_limit = std::numeric_limits<size_t>::max();
+  ASSERT_TRUE(handle.write(output).ok());
+  EXPECT_EQ("fixedvariablemessage" + payload, state_.written);
+  EXPECT_EQ(0, output.length());
+  ASSERT_EQ(1, state_.last_write_iov_bases.size());
+  EXPECT_EQ(payload_address, state_.last_write_iov_bases[0]);
+  EXPECT_EQ(1, payload_released);
+  EXPECT_EQ(4, state_.dealloc_calls);
+  EXPECT_TRUE(state_.allocations.empty());
+}
+
 TEST_F(UbSocketHandleImplTest, LargeOutputUsesOneBatchAndOneReturn) {
   TestEnvironment::setEnvVar("UBSOCKET_TRANS_MODE", "ub", true);
   Buffer::OwnedImpl buffer(Ubsocket::createOutputSliceFactory());
   const std::string payload(65536, 'b');
   buffer.add(payload);
-  EXPECT_EQ(9, state_.alloc_calls);
+  EXPECT_EQ(2, state_.alloc_calls);
   EXPECT_EQ(1, state_.batch_alloc_calls);
   EXPECT_EQ(payload, buffer.toString());
   buffer.drain(buffer.length());
@@ -389,7 +478,7 @@ TEST_F(UbSocketHandleImplTest, MovingLargeOutputObjectDoesNotReleaseTransferredS
   EXPECT_EQ(0, state_.dealloc_calls);
   EXPECT_EQ(payload, destination.toString());
   destination.drain(destination.length());
-  EXPECT_EQ(9, state_.dealloc_calls);
+  EXPECT_EQ(2, state_.dealloc_calls);
 }
 
 TEST_F(UbSocketHandleImplTest, BoundedOutputAddFragmentsAndLinearizePreserveBytes) {
@@ -402,6 +491,7 @@ TEST_F(UbSocketHandleImplTest, BoundedOutputAddFragmentsAndLinearizePreserveByte
   EXPECT_EQ(a + b, buffer.toString());
   const auto* contiguous = static_cast<const char*>(buffer.linearize(buffer.length()));
   EXPECT_EQ(a + b, std::string(contiguous, buffer.length()));
+  buffer.drain(buffer.length());
   EXPECT_TRUE(state_.allocations.empty());
 }
 
@@ -415,27 +505,46 @@ TEST_F(UbSocketHandleImplTest, DrainingDoesNotReturnBlockWithOutstandingTxRefere
   block->nshared.fetch_add(1, std::memory_order_relaxed); // Simulate successful asynchronous post.
   buffer.drain(buffer.length());
   EXPECT_EQ(1, block->nshared.load());
-  EXPECT_EQ(1, state_.dealloc_calls);
+  EXPECT_EQ(0, state_.dealloc_calls);
   EXPECT_EQ(1, state_.allocations.size());
   ASSERT_EQ(1, block->nshared.fetch_sub(1));
   ::ubsocket_iobuf_deallocate(block); // Simulated completion.
   EXPECT_TRUE(state_.allocations.empty());
 }
 
-TEST_F(UbSocketHandleImplTest, AddsPr9BlocksAsFragmentsAndReleasesOnDrain) {
+TEST_F(UbSocketHandleImplTest, SegmentsRespectReadLimitAndReleaseOnDrain) {
   state_.rx_chunks = {"hello", " world"};
   Buffer::OwnedImpl buffer;
   UbSocketHandleImpl handle(42, false, UbsocketAddressFamily);
-
-  Api::IoCallUint64Result result = handle.read(buffer, 4);
-
+  auto result = handle.read(buffer, 4);
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(11, result.return_value_);
+  EXPECT_EQ(4, result.return_value_);
+  EXPECT_EQ("hell", buffer.toString());
+  EXPECT_EQ(0, state_.dealloc_calls);
+  result = handle.read(buffer, 7);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(7, result.return_value_);
   EXPECT_EQ("hello world", buffer.toString());
-  EXPECT_EQ(1, state_.dealloc_calls); // RX anchor only.
-
   buffer.drain(buffer.length());
-  EXPECT_EQ(3, state_.dealloc_calls); // Anchor and two received blocks.
+  EXPECT_EQ(3, state_.dealloc_calls);
+  EXPECT_TRUE(state_.allocations.empty());
+}
+
+TEST_F(UbSocketHandleImplTest, ReadAndWriteRespectSegmentCountLimit) {
+  state_.rx_chunks = std::vector<std::string>(65, "x");
+  Buffer::OwnedImpl buffer;
+  UbSocketHandleImpl handle(42, false, UbsocketAddressFamily);
+  auto result = handle.read(buffer, std::nullopt);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(64, result.return_value_);
+  ASSERT_TRUE(handle.read(buffer, std::nullopt).ok());
+  EXPECT_EQ(65, buffer.length());
+  const auto slices = buffer.getRawSlices();
+  result = handle.writev(slices.data(), slices.size());
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(64, result.return_value_);
+  EXPECT_EQ(64, state_.last_write_iovcnt);
+  buffer.drain(buffer.length());
   EXPECT_TRUE(state_.allocations.empty());
 }
 
@@ -448,11 +557,11 @@ TEST_F(UbSocketHandleImplTest, PropagatesFailClosedReadWithoutPosixFallback) {
 
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(EPROTONOSUPPORT, result.err_->getSystemErrorCode());
-  EXPECT_EQ(1, state_.dealloc_calls);
+  EXPECT_EQ(0, state_.dealloc_calls);
   EXPECT_EQ(0, buffer.length());
 }
 
-TEST_F(UbSocketHandleImplTest, ReturnsAgainForTransientReadAndReleasesAnchor) {
+TEST_F(UbSocketHandleImplTest, ReturnsAgainWithoutAllocatingAnAnchor) {
   state_.read_error = EAGAIN;
   Buffer::OwnedImpl buffer;
   UbSocketHandleImpl handle(42, false, UbsocketAddressFamily);
@@ -462,8 +571,8 @@ TEST_F(UbSocketHandleImplTest, ReturnsAgainForTransientReadAndReleasesAnchor) {
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(Api::IoError::IoErrorCode::Again, result.err_->getErrorCode());
   EXPECT_EQ(EAGAIN, result.err_->getSystemErrorCode());
-  EXPECT_EQ(1, state_.alloc_calls);
-  EXPECT_EQ(1, state_.dealloc_calls);
+  EXPECT_EQ(0, state_.alloc_calls);
+  EXPECT_EQ(0, state_.dealloc_calls);
   EXPECT_TRUE(state_.allocations.empty());
   EXPECT_EQ(0, buffer.length());
 }
@@ -600,13 +709,13 @@ TEST_F(UbSocketHandleImplTest, AdaptiveReservationGrowsAndReturnsUnusedBlocks) {
     EXPECT_EQ(Ubsocket::ReadBudgetPayloadCapacity, first.return_value_);
     EXPECT_EQ(data.size() - Ubsocket::ReadBudgetPayloadCapacity, second.return_value_);
     EXPECT_EQ(data, buffer.toString());
-    EXPECT_EQ(6, state_.alloc_calls);
-    EXPECT_EQ(3, state_.dealloc_calls);
+    EXPECT_EQ(2, state_.alloc_calls);
+    EXPECT_EQ(0, state_.dealloc_calls);
   }
   EXPECT_EQ(0, ::close(fds[0]));
 
   buffer.drain(buffer.length());
-  EXPECT_EQ(6, state_.dealloc_calls);
+  EXPECT_EQ(2, state_.dealloc_calls);
   EXPECT_TRUE(state_.allocations.empty());
 }
 
@@ -626,14 +735,14 @@ TEST_F(UbSocketHandleImplTest, ShortReadUsesOneBlockForDrainToAgainProbe) {
     ASSERT_FALSE(again.ok());
     EXPECT_TRUE(again.wouldBlock());
     EXPECT_EQ(data, buffer.toString());
-    // 1-block read + 5-block read + 1-block EAGAIN probe.
-    EXPECT_EQ(7, state_.alloc_calls);
-    EXPECT_EQ(4, state_.dealloc_calls);
+    // One 64K block for each of the two reads and the EAGAIN probe.
+    EXPECT_EQ(3, state_.alloc_calls);
+    EXPECT_EQ(1, state_.dealloc_calls);
   }
   EXPECT_EQ(0, ::close(fds[0]));
 
   buffer.drain(buffer.length());
-  EXPECT_EQ(7, state_.dealloc_calls);
+  EXPECT_EQ(3, state_.dealloc_calls);
   EXPECT_TRUE(state_.allocations.empty());
 }
 
@@ -657,13 +766,13 @@ TEST_F(UbSocketHandleImplTest, AdaptiveReservationReachesNineBlocksFor64KiB) {
     EXPECT_EQ(5 * Ubsocket::ReadBudgetPayloadCapacity, second.return_value_);
     EXPECT_EQ(data.size() - 6 * Ubsocket::ReadBudgetPayloadCapacity, third.return_value_);
     EXPECT_EQ(data, buffer.toString());
-    EXPECT_EQ(15, state_.alloc_calls);
-    EXPECT_EQ(6, state_.dealloc_calls);
+    EXPECT_EQ(4, state_.alloc_calls);
+    EXPECT_EQ(1, state_.dealloc_calls);
   }
   EXPECT_EQ(0, ::close(fds[0]));
 
   buffer.drain(buffer.length());
-  EXPECT_EQ(15, state_.dealloc_calls);
+  EXPECT_EQ(4, state_.dealloc_calls);
   EXPECT_TRUE(state_.allocations.empty());
 }
 
@@ -690,13 +799,13 @@ TEST_F(UbSocketHandleImplTest, AdaptiveReservationPreservesLargerStreamAcrossRea
     EXPECT_EQ(data.size() - 6 * Ubsocket::ReadBudgetPayloadCapacity, third.return_value_);
 
     EXPECT_EQ(data, buffer.toString());
-    EXPECT_EQ(15, state_.alloc_calls);
-    EXPECT_EQ(5, state_.dealloc_calls);
+    EXPECT_EQ(4, state_.alloc_calls);
+    EXPECT_EQ(1, state_.dealloc_calls);
   }
   EXPECT_EQ(0, ::close(fds[0]));
 
   buffer.drain(buffer.length());
-  EXPECT_EQ(15, state_.dealloc_calls);
+  EXPECT_EQ(4, state_.dealloc_calls);
   EXPECT_TRUE(state_.allocations.empty());
 }
 
@@ -751,7 +860,7 @@ TEST_F(UbSocketHandleImplTest, UnboundedUnixReadUsesOneBlockForInitialAgain) {
   EXPECT_EQ(0, ::close(fds[0]));
 }
 
-TEST_F(UbSocketHandleImplTest, LearnsTwoBlocksForEightKiBWithoutExtraDataRead) {
+TEST_F(UbSocketHandleImplTest, LearnsTwoBudgetUnitsInOnePhysicalBlock) {
   int fds[2];
   ASSERT_EQ(0, ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds));
   Buffer::OwnedImpl buffer;
@@ -771,7 +880,7 @@ TEST_F(UbSocketHandleImplTest, LearnsTwoBlocksForEightKiBWithoutExtraDataRead) {
     const auto result = handle.read(buffer, std::nullopt);
     ASSERT_TRUE(result.ok());
     EXPECT_EQ(data.size(), result.return_value_);
-    EXPECT_EQ(2, state_.alloc_calls - before);
+    EXPECT_EQ(1, state_.alloc_calls - before);
     EXPECT_EQ(1, state_.batch_alloc_calls - batch_before);
     EXPECT_EQ(data, buffer.toString());
     EXPECT_TRUE(handle.read(buffer, std::nullopt).wouldBlock());
@@ -803,7 +912,7 @@ TEST_F(UbSocketHandleImplTest, ShrinkUsesLargestObservationInWindow) {
     const int before = state_.alloc_calls;
     ASSERT_EQ(1, ::write(fds[0], "x", 1));
     ASSERT_TRUE(handle.read(buffer, std::nullopt).ok());
-    EXPECT_EQ(3, state_.alloc_calls - before); // Not two blocks from the final short round.
+    EXPECT_EQ(1, state_.alloc_calls - before); // Three budget units fit in one physical block.
   }
   EXPECT_EQ(0, ::close(fds[0]));
 }
@@ -830,7 +939,7 @@ TEST_F(UbSocketHandleImplTest, ReadLengthLimitDoesNotTrainSmallerReservation) {
     const int before = state_.alloc_calls;
     ASSERT_EQ(1, ::write(fds[0], "x", 1));
     ASSERT_TRUE(handle.read(buffer, std::nullopt).ok());
-    EXPECT_EQ(9, state_.alloc_calls - before);
+    EXPECT_EQ(2, state_.alloc_calls - before);
   }
   EXPECT_EQ(0, ::close(fds[0]));
 }
@@ -884,31 +993,53 @@ extern "C" void ubsocket_iobuf_deallocate_batch(void* const* blocks, uint32_t co
   }
 }
 
-extern "C" ssize_t ubsocket_readv(int, const struct iovec* iov, int iovcnt) {
+extern "C" int ubsocket_query_capabilities(Envoy::Network::Ubsocket::Capabilities* caps) {
+  auto* state = Envoy::Network::fake_ubsocket_state;
+  if (state == nullptr) {
+    return -1;
+  }
+  ++state->query_calls;
+  caps->abi_version = state->abi_version;
+  caps->block_size = state->block_size;
+  caps->block_header_size = sizeof(Envoy::Network::Ubsocket::Block);
+  caps->max_batch_size = state->max_batch_size;
+  caps->feature_flags = state->feature_flags;
+  return 0;
+}
+
+extern "C" void ubsocket_release_zc(void* owner) {
+  auto* block = static_cast<Envoy::Network::Ubsocket::Block*>(owner);
+  if (block->nshared.fetch_sub(1) == 1) {
+    ubsocket_iobuf_deallocate(owner);
+  }
+}
+
+extern "C" ssize_t ubsocket_read_zc(int, Envoy::Network::Ubsocket::Segment* segments,
+                                    uint32_t count, size_t budget) {
   auto& state = *Envoy::Network::fake_ubsocket_state;
   if (state.read_error != 0) {
     errno = state.read_error;
     return -1;
   }
-  if (iovcnt != 1) {
-    errno = EINVAL;
-    return -1;
-  }
-
-  using Envoy::Network::Ubsocket::Block;
-  auto* anchor = reinterpret_cast<Block*>(static_cast<char*>(iov[0].iov_base) - sizeof(Block));
-  Block* tail = anchor;
-  ssize_t total = 0;
-  for (const std::string& chunk : state.rx_chunks) {
-    Block* block = Envoy::Network::makeBlock(chunk);
-    tail->u.next = block;
-    tail = block;
-    total += static_cast<ssize_t>(chunk.size());
+  size_t total = 0;
+  for (uint32_t i = 0; i < count && total < budget && state.rx_chunk_index < state.rx_chunks.size();
+       ++i) {
+    const auto& chunk = state.rx_chunks[state.rx_chunk_index];
+    const size_t length = std::min(budget - total, chunk.size() - state.rx_chunk_offset);
+    auto* block =
+        Envoy::Network::makeBlock(absl::string_view(chunk).substr(state.rx_chunk_offset, length));
+    segments[i] = {block->data, length, block};
+    total += length;
+    state.rx_chunk_offset += length;
+    if (state.rx_chunk_offset == chunk.size()) {
+      ++state.rx_chunk_index;
+      state.rx_chunk_offset = 0;
+    }
   }
   return total;
 }
 
-extern "C" ssize_t ubsocket_writev(int, const struct iovec* iov, int iovcnt) {
+extern "C" ssize_t ubsocket_writev_zc(int, const struct iovec* iov, int iovcnt) {
   auto& state = *Envoy::Network::fake_ubsocket_state;
   if (state.write_error != 0) {
     errno = state.write_error;
@@ -919,9 +1050,13 @@ extern "C" ssize_t ubsocket_writev(int, const struct iovec* iov, int iovcnt) {
   state.last_write_iov_bases.clear();
   ssize_t total = 0;
   for (int i = 0; i < iovcnt; ++i) {
+    const size_t length = std::min(iov[i].iov_len, state.write_limit - total);
+    if (length == 0) {
+      break;
+    }
     state.last_write_iov_bases.push_back(iov[i].iov_base);
-    state.written.append(static_cast<const char*>(iov[i].iov_base), iov[i].iov_len);
-    total += static_cast<ssize_t>(iov[i].iov_len);
+    state.written.append(static_cast<const char*>(iov[i].iov_base), length);
+    total += static_cast<ssize_t>(length);
   }
   return total;
 }

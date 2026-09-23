@@ -118,6 +118,7 @@ envoy_cc_library(
         "//source/common/common:compiler_requirements_lib",
         "//source/common/common:perf_annotation_lib",
         "//source/common/grpc:google_grpc_context_lib",
+        "//source/common/network:default_socket_interface_lib",
         "//source/server:hot_restart_lib",
         "//source/server:hot_restart_nop_lib",
         "//source/server:options_lib",

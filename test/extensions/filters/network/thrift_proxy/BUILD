@@ -153,6 +153,7 @@ envoy_extension_cc_test(
     extension_names = ["envoy.filters.network.thrift_proxy"],
     rbe_pool = "6gig",
     deps = [
+        "//source/extensions/filters/network/thrift_proxy:binary_protocol_lib",
         "//source/extensions/filters/network/thrift_proxy:ttheader_transport_lib",
         "//test/test_common:printers_lib",
         "//test/test_common:utility_lib",

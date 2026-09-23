@@ -1,3 +1,4 @@
+#include <array>
 #include <memory>
 #include <string>
 
@@ -94,6 +95,82 @@ TEST_F(OwnedImplTest, MoveBufferFragment) {
 
   EXPECT_CALL(release_callback_tracker, Call(_, _, _));
   buffer2.drain(buffer2.length());
+}
+
+TEST_F(OwnedImplTest, ControlledExternalCoalescingRequiresMatchingDomainAndCapacity) {
+  const int first_domain = 0;
+  const int second_domain = 0;
+  struct Case {
+    const void* source_domain;
+    const void* destination_domain;
+    size_t size;
+    size_t capacity;
+    bool heap_destination;
+    bool coalesced;
+  };
+  const Case cases[] = {
+      {&first_domain, &first_domain, 511, 1024, false, true},
+      {&first_domain, &first_domain, 512, 1024, false, false},
+      {nullptr, &first_domain, 3, 1024, false, false},
+      {&first_domain, nullptr, 3, 1024, false, false},
+      {&first_domain, &second_domain, 3, 1024, false, false},
+      {&first_domain, &first_domain, 3, 1, false, false},
+      {&first_domain, nullptr, 3, 1024, true, false},
+  };
+  for (size_t i = 0; i < std::size(cases); ++i) {
+    SCOPED_TRACE(i);
+    const auto& item = cases[i];
+    std::array<uint8_t, 1024> source_storage{};
+    std::array<uint8_t, 1024> destination_storage{};
+    int source_released = 0;
+    int destination_released = 0;
+    OwnedImpl source;
+    OwnedImpl destination;
+    Slice source_slice(
+        source_storage.data(), source_storage.size(), [&] { ++source_released; },
+        item.source_domain);
+    const std::string data(item.size, 's');
+    ASSERT_EQ(data.size(), source_slice.append(data.data(), data.size()));
+    source.addExternalSlice(std::move(source_slice));
+    if (!item.heap_destination) {
+      Slice destination_slice(
+          destination_storage.data(), item.capacity, [&] { ++destination_released; },
+          item.destination_domain);
+      ASSERT_EQ(1, destination_slice.append("d", 1));
+      destination.addExternalSlice(std::move(destination_slice));
+    } else {
+      destination.add("d");
+    }
+    destination.move(source);
+    EXPECT_EQ("d" + data, destination.toString());
+    EXPECT_EQ(item.coalesced ? 1 : 2, destination.getRawSlices().size());
+    EXPECT_EQ(item.coalesced ? 1 : 0, source_released);
+    EXPECT_EQ(0, destination_released);
+    destination.drain(destination.length());
+    EXPECT_EQ(1, source_released);
+    EXPECT_EQ(item.heap_destination ? 0 : 1, destination_released);
+  }
+}
+
+TEST_F(OwnedImplTest, ControlledExternalDomainTransfersWithSliceOwnership) {
+  const int domain = 0;
+  std::array<uint8_t, 64> first_storage{};
+  std::array<uint8_t, 64> second_storage{};
+  int released = 0;
+  Slice first(
+      first_storage.data(), first_storage.size(), [&] { ++released; }, &domain);
+  Slice target(
+      second_storage.data(), second_storage.size(), [] {}, &domain);
+  Slice moved(std::move(first));
+  EXPECT_TRUE(moved.canCoalesceInto(target));
+  EXPECT_FALSE(first.canCoalesceInto(target));
+  Slice assigned;
+  assigned = std::move(moved);
+  EXPECT_TRUE(assigned.canCoalesceInto(target));
+  EXPECT_FALSE(moved.canCoalesceInto(target));
+  EXPECT_EQ(0, released);
+  assigned = Slice{};
+  EXPECT_EQ(1, released);
 }
 
 TEST_F(OwnedImplTest, MoveBufferFragmentWithReleaseDrainTracker) {
@@ -1384,9 +1461,7 @@ TYPED_TEST(OwnedImplTypedTest, ReserveZeroCommit) {
   buf.prepend("bbbbb");
   buf.add("");
   OwnedImplTest::expectSlices({{5, 0, 4096}, {0, 0, 0}}, buf);
-  {
-    auto reservation = buf.reserveSingleSlice(1280);
-  }
+  { auto reservation = buf.reserveSingleSlice(1280); }
   OwnedImplTest::expectSlices({{5, 0, 4096}}, buf);
   os_fd_t fds[2] = {0, 0};
   auto& os_sys_calls = Api::OsSysCallsSingleton::get();

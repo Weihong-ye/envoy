@@ -25,6 +25,10 @@
 #include "absl/debugging/symbolize.h"
 #include "absl/strings/str_split.h"
 
+#if defined(__linux__) && !defined(__ANDROID_API__)
+#include "source/common/network/ub_socket_handle_impl.h"
+#endif
+
 #ifdef ENVOY_HOT_RESTART
 #include "source/server/hot_restart_impl.h"
 #endif
@@ -162,6 +166,9 @@ int MainCommon::main(int argc, char** argv, PostServerHook hook) {
   absl::InitializeSymbolizer(argv[0]);
 #endif
   Thread::MainThread main_thread;
+#if defined(__linux__) && !defined(__ANDROID_API__)
+  Network::Ubsocket::Runtime ubsocket_runtime;
+#endif
   std::unique_ptr<Envoy::MainCommon> main_common;
 
   // Initialize the server's main context under a try/catch loop and simply return EXIT_FAILURE

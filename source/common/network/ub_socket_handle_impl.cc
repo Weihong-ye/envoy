@@ -24,8 +24,7 @@ namespace Envoy {
 namespace Network {
 namespace {
 
-constexpr size_t MaxUbsocketIov = 1024;
-constexpr size_t MaxRxChainBlocks = 4096;
+constexpr size_t MaxUbsocketIov = 64;
 constexpr size_t MaxUdsReadBlocks = 9;
 constexpr size_t MediumUdsReadBlocks = 5;
 constexpr size_t MinUdsReadBlocks = 1;
@@ -35,17 +34,19 @@ static_assert(MaxUdsReadReservation == 73440,
               "nine UBSocket payload blocks must expose 73440 bytes");
 
 size_t configuredBlockSize() {
-  const char* mode = std::getenv("UBSOCKET_UB_TRANS_MODE");
-  // UBSocket defaults to a different transport when unset; do not guess its block layout.
-  if (mode == nullptr || std::strcmp(mode, "RC_TP") != 0) {
-    return 0;
-  }
-  const char* value = std::getenv("UBSOCKET_BLOCK_TYPE");
-  if (value == nullptr || std::strcmp(value, "default") == 0 || std::strcmp(value, "16k") == 0) {
-    return Ubsocket::DefaultBlockSize;
-  }
-  if (std::strcmp(value, "8k") == 0) {
-    return Ubsocket::ReadBudgetBlockSize;
+  using QueryFn = int (*)(Ubsocket::Capabilities*);
+  void* symbol = dlsym(RTLD_DEFAULT, "ubsocket_query_capabilities");
+  QueryFn query = nullptr;
+  static_assert(sizeof(query) == sizeof(symbol));
+  std::memcpy(&query, &symbol, sizeof(query)); // NOLINT(safe-memcpy)
+  Ubsocket::Capabilities caps{};
+  caps.struct_size = sizeof(caps);
+  constexpr uint64_t required_features = 1 | 2 | 4 | 8 | 16;
+  if (query != nullptr && query(&caps) == 0 && caps.abi_version == 1 &&
+      caps.block_size == Ubsocket::DefaultBlockSize &&
+      caps.block_header_size == sizeof(Ubsocket::Block) && caps.max_batch_size >= MaxUbsocketIov &&
+      (caps.feature_flags & required_features) == required_features) {
+    return caps.block_size;
   }
   return 0;
 }
@@ -89,17 +90,6 @@ void releaseBlock(const Ubsocket::Api& api, Ubsocket::Block* block) {
   }
 }
 
-void releaseChain(const Ubsocket::Api& api, Ubsocket::Block* block) {
-  Buffer::ExternalStorageReleaseBatch batch;
-  size_t count = 0;
-  while (block != nullptr && count++ < MaxRxChainBlocks) {
-    Ubsocket::Block* next = block->u.next;
-    block->u.next = nullptr;
-    releaseBlock(api, block);
-    block = next;
-  }
-}
-
 Ubsocket::Block* initializeBlock(void* raw, size_t data_size, size_t capacity) {
   auto* block = static_cast<Ubsocket::Block*>(raw);
   block->nshared.store(1, std::memory_order_relaxed);
@@ -122,15 +112,6 @@ bool allocateBlocks(const Ubsocket::Api& api, Ubsocket::Block** blocks, size_t c
     blocks[i] = initializeBlock(raw[i], 0, api.blockPayloadCapacity());
   }
   return true;
-}
-
-Ubsocket::Block* allocateBlock(const Ubsocket::Api& api, size_t data_size) {
-  Ubsocket::Block* block;
-  if (!allocateBlocks(api, &block, 1)) {
-    return nullptr;
-  }
-  block->size = data_size;
-  return block;
 }
 
 void attachBlock(Buffer::Instance& buffer, const Ubsocket::Api& api, Ubsocket::Block* block) {
@@ -170,16 +151,39 @@ size_t Api::blockPayloadCapacity() const {
 void resetBlockLayoutForTest() { blockSizeCache() = configuredBlockSize(); }
 
 Api::Api()
-    : readv_(loadUbsocketSymbol<ReadvFn>("ubsocket_readv")),
-      writev_(loadUbsocketSymbol<WritevFn>("ubsocket_writev")),
+    : readv_(loadUbsocketSymbol<ReadvFn>("ubsocket_read_zc")),
+      release_(loadUbsocketSymbol<ReleaseFn>("ubsocket_release_zc")),
+      writev_(loadUbsocketSymbol<WritevFn>("ubsocket_writev_zc")),
       iobuf_allocate_batch_(
           loadUbsocketSymbol<IobufAllocateBatchFn>("ubsocket_iobuf_allocate_batch")),
       iobuf_deallocate_batch_(
           loadUbsocketSymbol<IobufDeallocateBatchFn>("ubsocket_iobuf_deallocate_batch")),
-      available_(readv_ != nullptr && writev_ != nullptr && iobuf_allocate_batch_ != nullptr &&
-                 iobuf_deallocate_batch_ != nullptr) {}
+      available_(readv_ != nullptr && release_ != nullptr && writev_ != nullptr &&
+                 iobuf_allocate_batch_ != nullptr && iobuf_deallocate_batch_ != nullptr) {}
 
 bool zeroCopyEnabled() { return Api::instance().available() && transportModeIsUb(); }
+bool transportEnabled() { return transportModeIsUb(); }
+
+Runtime::Runtime() {
+  if (!transportEnabled()) {
+    return;
+  }
+  const auto init = loadUbsocketSymbol<int (*)()>("ubsocket_preload_init");
+  const auto uninit = loadUbsocketSymbol<void (*)()>("ubsocket_preload_uninit");
+  if (init == nullptr || uninit == nullptr || init() != 0) {
+    ENVOY_LOG_MISC(error,
+                   "UBSocket v2 runtime unavailable; explicitly selected UB sockets will fail");
+    return;
+  }
+  uninit_ = uninit;
+  ENVOY_LOG_MISC(info, "UBSocket v2 runtime initialized (64 KiB physical blocks)");
+}
+
+Runtime::~Runtime() {
+  if (uninit_ != nullptr) {
+    uninit_();
+  }
+}
 
 void resetTransportModeCacheForTest() { transportModeCache().store(-1, std::memory_order_release); }
 
@@ -190,7 +194,7 @@ Buffer::OwnedImpl::SliceFactory createOutputSliceFactory(bool ub_destination) {
     return {};
   }
   RELEASE_ASSERT(api.blockPayloadCapacity() != 0,
-                 "UB ZC requires RC_TP and UBSOCKET_BLOCK_TYPE=default/8k/16k");
+                 "UB ZC requires the v2 segment ABI with 64 KiB blocks");
 
   return [&api](uint64_t min_capacity, uint32_t max_slices, void* context,
                 Buffer::OwnedImpl::SliceConsumer consume) {
@@ -207,8 +211,9 @@ Buffer::OwnedImpl::SliceFactory createOutputSliceFactory(bool ub_destination) {
     }
     for (size_t i = 0; i < count; ++i) {
       Block* block = blocks[i];
-      consume(context, Buffer::Slice(reinterpret_cast<uint8_t*>(block->data), capacity,
-                                     [&api, block]() { releaseBlock(api, block); }));
+      consume(context, Buffer::Slice(
+                           reinterpret_cast<uint8_t*>(block->data), capacity,
+                           [&api, block]() { releaseBlock(api, block); }, &api));
     }
   };
 }
@@ -325,81 +330,92 @@ Api::IoCallUint64Result UbUnixSocketHandleImpl::read(Buffer::Instance& buffer,
                                  Api::IoError::none());
 }
 
+Api::SysCallIntResult UbSocketHandleImpl::bind(Address::InstanceConstSharedPtr address) {
+  return creation_error_ != 0 ? Api::SysCallIntResult{-1, creation_error_}
+                              : IoSocketHandleImpl::bind(std::move(address));
+}
+
+Api::SysCallIntResult UbSocketHandleImpl::connect(Address::InstanceConstSharedPtr address) {
+  return creation_error_ != 0 ? Api::SysCallIntResult{-1, creation_error_}
+                              : IoSocketHandleImpl::connect(std::move(address));
+}
+
+Api::SysCallIntResult UbSocketHandleImpl::listen(int backlog) {
+  return creation_error_ != 0 ? Api::SysCallIntResult{-1, creation_error_}
+                              : IoSocketHandleImpl::listen(backlog);
+}
+
+IoHandlePtr UbSocketHandleImpl::duplicate() {
+  if (creation_error_ != 0) {
+    errno = creation_error_;
+    return nullptr;
+  }
+  return IoSocketHandleImpl::duplicate();
+}
+
 Api::IoCallUint64Result UbSocketHandleImpl::read(Buffer::Instance& buffer,
                                                  std::optional<uint64_t> max_length_opt) {
-  if (max_length_opt.value_or(std::numeric_limits<uint64_t>::max()) == 0) {
+  const size_t budget = static_cast<size_t>(
+      std::min<uint64_t>(max_length_opt.value_or(std::numeric_limits<ssize_t>::max()),
+                         std::numeric_limits<ssize_t>::max()));
+  if (budget == 0) {
     return Api::ioCallUint64ResultNoError();
   }
-
   const Ubsocket::Api& api = Ubsocket::Api::instance();
   if (!api.available()) {
-    return failClosedResult(ENOSYS, "ubsocket_readv symbols unavailable", fd_);
+    return failClosedResult(ENOSYS, "UBSocket v2 segment ABI unavailable", fd_);
   }
-  const size_t capacity = api.blockPayloadCapacity();
-  if (capacity == 0) {
-    return failClosedResult(EINVAL, "unsupported UB block layout or transport mode", fd_);
+  if (creation_error_ != 0) {
+    return failClosedResult(creation_error_, "UB socket creation", fd_);
   }
-
-  Ubsocket::Block* anchor = allocateBlock(api, 0);
-  if (anchor == nullptr) {
-    const int error = errno;
-    return failClosedResult(error, "ubsocket RX anchor allocation (check block layout and library)",
-                            fd_);
-  }
-
-  struct iovec iov = {anchor->data, capacity};
-  const ssize_t rc = api.readv_(fd_, &iov, 1);
+  std::array<Ubsocket::Segment, MaxUbsocketIov> segments{};
+  const ssize_t rc = api.readv_(fd_, segments.data(), segments.size(), budget);
   const int saved_errno = errno;
   if (rc <= 0) {
-    releaseBlock(api, anchor);
     if (rc == 0) {
       return Api::ioCallUint64ResultNoError();
     }
-    if (isAgainError(saved_errno)) {
-      return againResult();
-    }
-    return failClosedResult(saved_errno, "ubsocket_readv", fd_);
+    return isAgainError(saved_errno) ? againResult()
+                                     : failClosedResult(saved_errno, "ubsocket_read_zc", fd_);
   }
 
-  absl::InlinedVector<Ubsocket::Block*, 64> blocks;
-  Ubsocket::Block* block = anchor->u.next;
-  uint64_t received = 0;
-  bool valid = block != nullptr;
-  while (valid && block != nullptr && received < static_cast<uint64_t>(rc) &&
-         blocks.size() < MaxRxChainBlocks) {
-    const bool valid_block =
-        block->data == reinterpret_cast<char*>(block) + sizeof(Ubsocket::Block) &&
-        block->cap != 0 && block->cap <= capacity &&
-        received + block->cap <= static_cast<uint64_t>(rc);
-    if (!valid_block) {
+  size_t received = 0;
+  bool valid = static_cast<uint64_t>(rc) <= budget;
+  for (const auto& segment : segments) {
+    if (segment.owner == nullptr) {
+      valid = valid && segment.data == nullptr && segment.length == 0;
+      continue;
+    }
+    if (segment.data == nullptr || segment.length == 0 ||
+        segment.length > static_cast<uint64_t>(rc) - received) {
       valid = false;
-      break;
+    } else {
+      received += segment.length;
     }
-    blocks.push_back(block);
-    received += block->cap;
-    block = block->u.next;
   }
-  valid = valid && received == static_cast<uint64_t>(rc) && block == nullptr;
-
-  if (!valid) {
-    Ubsocket::Block* chain = anchor->u.next;
-    anchor->u.next = nullptr;
-    releaseChain(api, chain);
-    releaseBlock(api, anchor);
-    return failClosedResult(EPROTO, "invalid ubsocket_readv block chain", fd_);
+  if (!valid || received != static_cast<uint64_t>(rc)) {
+    for (const auto& segment : segments) {
+      if (segment.owner != nullptr) {
+        api.release_(segment.owner);
+      }
+    }
+    return failClosedResult(EPROTO, "invalid UBSocket v2 segments", fd_);
   }
-
-  anchor->u.next = nullptr;
-  releaseBlock(api, anchor);
-  for (Ubsocket::Block* received_block : blocks) {
-    received_block->u.next = nullptr;
-    attachBlock(buffer, api, received_block);
+  for (const auto& segment : segments) {
+    if (segment.owner != nullptr) {
+      static_cast<Buffer::OwnedImpl&>(buffer).addExternalSlice(
+          Buffer::Slice(segment.data, segment.length,
+                        [release = api.release_, owner = segment.owner]() { release(owner); }));
+    }
   }
   return Api::IoCallUint64Result(static_cast<uint64_t>(rc), Api::IoError::none());
 }
 
 Api::IoCallUint64Result UbSocketHandleImpl::writev(const Buffer::RawSlice* slices,
                                                    uint64_t num_slice) {
+  if (creation_error_ != 0) {
+    return failClosedResult(creation_error_, "UB socket creation", fd_);
+  }
   const Ubsocket::Api& api = Ubsocket::Api::instance();
   if (!api.available()) {
     return failClosedResult(ENOSYS, "ubsocket_writev symbols unavailable", fd_);
@@ -413,7 +429,7 @@ Api::IoCallUint64Result UbSocketHandleImpl::writev(const Buffer::RawSlice* slice
   for (uint64_t i = 0; i < num_slice; ++i) {
     if (slices[i].mem_ != nullptr && slices[i].len_ != 0) {
       if (iov.size() == MaxUbsocketIov) {
-        return failClosedResult(E2BIG, "ubsocket_writev iovec limit", fd_);
+        break;
       }
       iov.push_back({slices[i].mem_, slices[i].len_});
     }

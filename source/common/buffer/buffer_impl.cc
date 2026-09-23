@@ -351,13 +351,13 @@ void* OwnedImpl::linearize(uint32_t size) {
 void OwnedImpl::coalesceOrAddSlice(Slice&& other_slice) {
   const uint64_t slice_size = other_slice.dataSize();
   // The `other_slice` content can be coalesced into the existing slice IFF:
-  // 1. The `other_slice` can be coalesced. Immutable slices can not be safely coalesced because
-  // their destructors can be arbitrary global side effects.
+  // 1. The `other_slice` can be coalesced into the destination. Immutable slices remain excluded;
+  // mutable external slices must explicitly opt into the same ownership domain.
   // 2. There are existing slices;
   // 3. The `other_slice` content length is under the CopyThreshold;
   // 4. There is enough unused space in the existing slice to accommodate the `other_slice` content.
-  if (other_slice.canCoalesce() && !slices_.empty() && slice_size < CopyThreshold &&
-      slices_.back().reservableSize() >= slice_size) {
+  if (!slices_.empty() && other_slice.canCoalesceInto(slices_.back()) &&
+      slice_size < CopyThreshold && slices_.back().reservableSize() >= slice_size) {
     // Copy content of the `other_slice`. The `move` methods which call this method effectively
     // drain the source buffer.
     addImpl(other_slice.data(), slice_size);

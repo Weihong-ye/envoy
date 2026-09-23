@@ -132,9 +132,16 @@ ConnectionManager::sendLocalReply(MessageMetadata& metadata, const DirectRespons
   DirectResponse::ResponseType result = DirectResponse::ResponseType::Exception;
 
   if (!metadata.hasMessageType() || metadata.messageType() != MessageType::Oneway) {
+#if defined(__linux__)
+    const auto slice_factory = Network::Ubsocket::createOutputSliceFactory(
+        Network::Ubsocket::connectionUsesUbTransport(read_callbacks_->connection()));
+    Buffer::OwnedImpl buffer(slice_factory);
+    Buffer::OwnedImpl response_buffer(slice_factory);
+#else
     Buffer::OwnedImpl buffer;
-    result = response.encode(metadata, *protocol_, buffer);
     Buffer::OwnedImpl response_buffer;
+#endif
+    result = response.encode(metadata, *protocol_, buffer);
     metadata.setProtocol(protocol_->type());
     transport_->encodeFrame(response_buffer, metadata, buffer);
 
