@@ -1,3 +1,5 @@
+#include <limits>
+
 #include "envoy/common/exception.h"
 
 #include "source/common/buffer/buffer_impl.h"
@@ -119,8 +121,8 @@ TEST_F(TTHeaderTransportTest, EncodeFramePropagatesOutputSliceFactoryToHeader) {
 
   transport_.encodeFrame(output, metadata, message);
 
-  // One external slice is allocated for the fixed frame prefix and one for the encoded header.
-  EXPECT_EQ(2, allocations);
+  // The fixed prefix and variable header are encoded into the same final slice.
+  EXPECT_EQ(1, allocations);
   EXPECT_EQ(0, message.length());
 }
 
@@ -174,16 +176,211 @@ TEST_F(TTHeaderTransportTest, ControlledSmallHeadersPreserveWireAndPayload) {
     ASSERT_EQ(2, slices.size());
     EXPECT_EQ(payload.data(), slices[1].mem_);
     EXPECT_EQ(payload.size(), slices[1].len_);
-    EXPECT_EQ(3, allocations);
-    EXPECT_EQ(2, releases);
+    EXPECT_EQ(2, allocations);
+    EXPECT_EQ(1, releases);
     EXPECT_EQ(0, payload_releases);
     output.drain(7);
-    EXPECT_EQ(2, releases);
+    EXPECT_EQ(1, releases);
     output.drain(slices[0].len_ - 7);
-    EXPECT_EQ(3, releases);
+    EXPECT_EQ(2, releases);
     EXPECT_EQ(0, payload_releases);
     output.drain(payload.size());
     EXPECT_EQ(1, payload_releases);
+  }
+}
+
+TEST_F(TTHeaderTransportTest, DirectHeaderGrowsAcrossExternalBlocksWithoutMovingPayload) {
+  constexpr uint64_t Capacity = 65504;
+  uint64_t allocations = 0;
+  uint64_t releases = 0;
+  uint64_t payload_releases = 0;
+  Buffer::OwnedImpl::SliceFactory factory = [&](uint64_t, uint32_t, void* context,
+                                                Buffer::OwnedImpl::SliceConsumer consume) {
+    auto* storage = new uint8_t[Capacity];
+    ++allocations;
+    consume(context, Buffer::Slice(storage, Capacity, [&, storage] {
+              ++releases;
+              delete[] storage;
+            }));
+  };
+  const std::string service(40000, 's');
+  const std::string method(40000, 'm');
+  const std::string payload(4096, 'p');
+  MessageMetadata metadata(true);
+  metadata.setProtocol(ProtocolType::Binary);
+  metadata.setSequenceId(7);
+  metadata.requestHeaders().addCopy(TTHeaderIntKeyNames::get().ToService, service);
+  metadata.requestHeaders().addCopy(TTHeaderIntKeyNames::get().ToMethod, method);
+  Buffer::OwnedImpl message;
+  message.addExternalSlice(Buffer::Slice(static_cast<const void*>(payload.data()), payload.size(),
+                                         [&] { ++payload_releases; }));
+  Buffer::OwnedImpl output(factory);
+  output.add("prefix");
+
+  transport_.encodeFrame(output, metadata, message);
+
+  // Independent wire expectation: 2 + 3 + 2 * (2 + 2 + 40000) + 3 padding = 80016.
+  Buffer::OwnedImpl expected("prefix");
+  expected.writeBEInt<uint32_t>(80016 + 10 + payload.size());
+  expected.writeBEInt<uint16_t>(0x1000);
+  expected.writeBEInt<uint16_t>(0);
+  expected.writeBEInt<int32_t>(7);
+  expected.writeBEInt<uint16_t>(20004);
+  expected.add("\x00\x00\x10\x00\x02", 5);
+  expected.writeBEInt<uint16_t>(6);
+  expected.writeBEInt<uint16_t>(40000);
+  expected.add(service);
+  expected.writeBEInt<uint16_t>(9);
+  expected.writeBEInt<uint16_t>(40000);
+  expected.add(method);
+  expected.add("\0\0\0", 3);
+  expected.add(payload);
+  EXPECT_EQ(expected.toString(), output.toString());
+  EXPECT_EQ(0, message.length());
+  EXPECT_EQ(2, allocations);
+  EXPECT_EQ(0, releases);
+  const auto slices = output.getRawSlices();
+  ASSERT_EQ(3, slices.size());
+  EXPECT_EQ(Capacity, slices[0].len_);
+  EXPECT_EQ(payload.data(), slices[2].mem_);
+  EXPECT_EQ(payload.size(), slices[2].len_);
+  output.drain(slices[0].len_);
+  EXPECT_EQ(1, releases);
+  EXPECT_EQ(0, payload_releases);
+  output.drain(output.length() - payload.size());
+  EXPECT_EQ(2, releases);
+  EXPECT_EQ(0, payload_releases);
+  output.drain(payload.size());
+  EXPECT_EQ(1, payload_releases);
+}
+
+TEST_F(TTHeaderTransportTest, DirectHeaderPreservesPaddingForRequestsAndResponses) {
+  for (bool is_request : {false, true}) {
+    for (ProtocolType protocol : {ProtocolType::Binary, ProtocolType::Compact}) {
+      for (uint16_t length = 0; length < 4; ++length) {
+        SCOPED_TRACE(absl::StrCat(is_request, ":", static_cast<int>(protocol), ":", length));
+        MessageMetadata metadata(is_request);
+        metadata.setProtocol(protocol);
+        metadata.setSequenceId(1);
+        if (is_request) {
+          metadata.requestHeaders().addCopy(TTHeaderIntKeyNames::get().ToService,
+                                            std::string(length, 's'));
+        } else {
+          metadata.responseHeaders().addCopy(TTHeaderIntKeyNames::get().ToService,
+                                             std::string(length, 's'));
+        }
+        uint64_t allocations = 0;
+        Buffer::OwnedImpl output(externalSliceFactory(allocations));
+        Buffer::OwnedImpl message("p");
+
+        transport_.encodeFrame(output, metadata, message);
+
+        // Each case has a 12-byte header info section, with 3, 2, 1 or 0 padding bytes.
+        Buffer::OwnedImpl expected;
+        expected.add("\x00\x00\x00\x17\x10\x00\x00\x00\x00\x00\x00\x01\x00\x03", 14);
+        expected.writeByte(protocol == ProtocolType::Binary ? 0x00 : 0x02);
+        expected.add("\x00\x10\x00\x01\x00\x06", 6);
+        expected.writeBEInt<uint16_t>(length);
+        expected.add(std::string(length, 's'));
+        expected.add("\0\0\0", 3 - length);
+        expected.add("p");
+        EXPECT_EQ(expected.toString(), output.toString());
+        EXPECT_EQ(1, allocations);
+      }
+    }
+  }
+}
+
+TEST_F(TTHeaderTransportTest, RejectsOversizedStringsBeforeWritingFinalHeader) {
+  for (const auto& key : {TTHeaderIntKeyNames::get().ToService.get(), std::string("custom"),
+                          TTHeaderTransportImpl::aclTokenKey()}) {
+    SCOPED_TRACE(key);
+    MessageMetadata metadata(true);
+    metadata.setProtocol(ProtocolType::Binary);
+    metadata.requestHeaders().addCopy(Http::LowerCaseString(key), std::string(65536, 'x'));
+    uint64_t allocations = 0;
+    Buffer::OwnedImpl output(externalSliceFactory(allocations));
+    output.add("prefix");
+    Buffer::OwnedImpl message("payload");
+
+    EXPECT_THROW_WITH_REGEX(transport_.encodeFrame(output, metadata, message), EnvoyException,
+                            "string too long");
+    EXPECT_EQ("prefix", output.toString());
+    EXPECT_EQ("payload", message.toString());
+    EXPECT_EQ(1, allocations);
+  }
+}
+
+TEST_F(TTHeaderTransportTest, RejectsOversizedHeaderBeforeWritingFinalHeader) {
+  MessageMetadata metadata(true);
+  metadata.setProtocol(ProtocolType::Binary);
+  for (uint16_t id = 0; id < 5; ++id) {
+    metadata.requestHeaders().addCopy(*TTHeaderIntKeyNames::get().fromId(id),
+                                      std::string(60000, 'x'));
+  }
+  uint64_t allocations = 0;
+  Buffer::OwnedImpl output(externalSliceFactory(allocations));
+  output.add("prefix");
+  Buffer::OwnedImpl message("payload");
+
+  EXPECT_THROW_WITH_REGEX(transport_.encodeFrame(output, metadata, message), EnvoyException,
+                          "header too large");
+  EXPECT_EQ("prefix", output.toString());
+  EXPECT_EQ("payload", message.toString());
+  EXPECT_EQ(1, allocations);
+}
+
+TEST_F(TTHeaderTransportTest, DirectHeaderAcceptsMaximumHeaderAndStringLengths) {
+  MessageMetadata metadata(true);
+  metadata.setProtocol(ProtocolType::Binary);
+  for (uint16_t id = 0; id < 4; ++id) {
+    // 2 protocol bytes + 3 group bytes + 4 * 4 field bytes + values = 262140.
+    metadata.requestHeaders().addCopy(*TTHeaderIntKeyNames::get().fromId(id),
+                                      std::string(id < 3 ? 65535 : 65514, 'x'));
+  }
+  uint64_t allocations = 0;
+  Buffer::OwnedImpl output(externalSliceFactory(allocations));
+  Buffer::OwnedImpl message("payload");
+
+  transport_.encodeFrame(output, metadata, message);
+
+  EXPECT_EQ(262140 + 14 + 7, output.length());
+  EXPECT_EQ(65535, output.peekBEInt<uint16_t>(12));
+  EXPECT_EQ(1, allocations);
+  MessageMetadata decoded(true);
+  ASSERT_TRUE(transport_.decodeFrameStart(output, decoded));
+  for (uint16_t id = 0; id < 4; ++id) {
+    const auto fields = decoded.requestHeaders().get(*TTHeaderIntKeyNames::get().fromId(id));
+    ASSERT_EQ(1, fields.size());
+    EXPECT_EQ(std::string(id < 3 ? 65535 : 65514, 'x'), fields[0]->value().getStringView());
+  }
+  EXPECT_EQ("payload", output.toString());
+}
+
+TEST_F(TTHeaderTransportTest, RejectsOversizedFramesBeforeWritingFinalHeader) {
+  // Exercise frame arithmetic without allocating a multi-gigabyte payload.
+  class LengthOnlyBuffer : public Buffer::OwnedImpl {
+  public:
+    explicit LengthOnlyBuffer(uint64_t size) : size_(size) {}
+    uint64_t length() const override { return size_; }
+
+  private:
+    const uint64_t size_;
+  };
+  for (uint64_t size : {uint64_t{0x40000000}, std::numeric_limits<uint64_t>::max()}) {
+    SCOPED_TRACE(size);
+    MessageMetadata metadata(true);
+    metadata.setProtocol(ProtocolType::Binary);
+    uint64_t allocations = 0;
+    Buffer::OwnedImpl output(externalSliceFactory(allocations));
+    output.add("prefix");
+    LengthOnlyBuffer message(size);
+
+    EXPECT_THROW_WITH_REGEX(transport_.encodeFrame(output, metadata, message), EnvoyException,
+                            "frame too large");
+    EXPECT_EQ("prefix", output.toString());
+    EXPECT_EQ(size, message.length());
+    EXPECT_EQ(1, allocations);
   }
 }
 

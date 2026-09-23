@@ -5,7 +5,6 @@
 #include "envoy/common/exception.h"
 #include "envoy/http/header_formatter.h"
 
-#include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/macros.h"
 
 #include "absl/strings/match.h"
@@ -393,46 +392,44 @@ void TTHeaderTransportImpl::encodeFrame(Buffer::Instance& buffer, const MessageM
     metadata.responseHeaders().iterate(classify);
   }
 
-  const auto* owned_output = dynamic_cast<const Buffer::OwnedImpl*>(&buffer);
-  Buffer::OwnedImpl header_buffer(owned_output != nullptr ? owned_output->sliceFactory()
-                                                          : Buffer::OwnedImpl::SliceFactory{});
-
-  // PROTOCOL ID
+  uint8_t protocol_id;
   switch (metadata.protocol()) {
   case ProtocolType::Binary:
-    header_buffer.writeByte(static_cast<uint8_t>(TTProtocolId::ThriftBinary));
+    protocol_id = static_cast<uint8_t>(TTProtocolId::ThriftBinary);
     break;
   case ProtocolType::Compact:
-    header_buffer.writeByte(static_cast<uint8_t>(TTProtocolId::ThriftCompact));
+    protocol_id = static_cast<uint8_t>(TTProtocolId::ThriftCompact);
     break;
   default:
     throw EnvoyException(fmt::format("ttheader: cannot encode protocol {}",
                                      ProtocolNames::get().fromType(metadata.protocol())));
   }
 
-  // NUM TRANSFORMS（Kitex 恒为 0）
-  header_buffer.writeByte(0);
+  // Size and validate the classified fields before touching the final output. The output's
+  // SliceFactory can then grow the header across blocks without an intermediate header buffer.
+  const auto string_size = [](absl::string_view str) -> uint64_t {
+    if (str.size() > std::numeric_limits<uint16_t>::max()) {
+      throw EnvoyException(absl::StrCat("ttheader: string too long: ", str.size()));
+    }
+    return sizeof(uint16_t) + str.size();
+  };
+  uint64_t header_size = 2; // PROTOCOL ID + NUM TRANSFORMS.
 
   if (has_acl_token) {
-    header_buffer.writeByte(static_cast<uint8_t>(InfoId::AclToken));
-    writeString16(header_buffer, acl_token);
+    header_size += 1 + string_size(acl_token);
   }
 
   if (!str_kvs.empty()) {
-    header_buffer.writeByte(static_cast<uint8_t>(InfoId::KeyValue));
-    header_buffer.writeBEInt<uint16_t>(static_cast<uint16_t>(str_kvs.size()));
+    header_size += 3; // INFO ID + count.
     for (const auto& kv : str_kvs) {
-      writeString16(header_buffer, kv.first);
-      writeString16(header_buffer, kv.second);
+      header_size += string_size(kv.first) + string_size(kv.second);
     }
   }
 
   if (!int_kvs.empty()) {
-    header_buffer.writeByte(static_cast<uint8_t>(InfoId::IntKeyValue));
-    header_buffer.writeBEInt<uint16_t>(static_cast<uint16_t>(int_kvs.size()));
+    header_size += 3; // INFO ID + count.
     for (const auto& kv : int_kvs) {
-      header_buffer.writeBEInt<uint16_t>(kv.first);
-      writeString16(header_buffer, kv.second);
+      header_size += sizeof(uint16_t) + string_size(kv.second);
     }
   }
 
@@ -440,12 +437,8 @@ void TTHeaderTransportImpl::encodeFrame(Buffer::Instance& buffer, const MessageM
   // Apache 是 `4 - size % 4`（整除时补 4 字节），Kitex 是 `(4 - size % 4) % 4`
   // （整除时补 0 字节）。抄错会导致帧长偏移 4 字节，且只在 header 长度恰为
   // 4 的倍数时触发，表现为低频偶发解析失败。
-  uint64_t header_size = header_buffer.length();
   const uint64_t padding = (4 - (header_size % 4)) % 4;
-  if (padding > 0) {
-    header_buffer.add("\0\0\0", padding);
-    header_size += padding;
-  }
+  header_size += padding;
 
   if (header_size > static_cast<uint64_t>(MaxHeadersSize)) {
     throw EnvoyException(absl::StrCat("ttheader: header too large ", header_size));
@@ -455,7 +448,7 @@ void TTHeaderTransportImpl::encodeFrame(Buffer::Instance& buffer, const MessageM
   const uint64_t framed_prefix_size = restore_framed_prefix ? 4 : 0;
 
   const uint64_t frame_size = header_size + framed_prefix_size + msg_size + MetaSizeNoLength;
-  if (frame_size > static_cast<uint64_t>(MaxFrameSize)) {
+  if (frame_size > static_cast<uint64_t>(MaxFrameSize) || frame_size < msg_size) {
     throw EnvoyException(absl::StrCat("ttheader: frame too large ", frame_size));
   }
 
@@ -465,7 +458,29 @@ void TTHeaderTransportImpl::encodeFrame(Buffer::Instance& buffer, const MessageM
   buffer.writeBEInt<int32_t>(metadata.hasSequenceId() ? metadata.sequenceId() : 0);
   buffer.writeBEInt<uint16_t>(static_cast<uint16_t>(header_size / 4));
 
-  buffer.move(header_buffer);
+  buffer.writeByte(protocol_id);
+  buffer.writeByte(0); // NUM TRANSFORMS.
+  if (has_acl_token) {
+    buffer.writeByte(static_cast<uint8_t>(InfoId::AclToken));
+    writeString16(buffer, acl_token);
+  }
+  if (!str_kvs.empty()) {
+    buffer.writeByte(static_cast<uint8_t>(InfoId::KeyValue));
+    buffer.writeBEInt<uint16_t>(static_cast<uint16_t>(str_kvs.size()));
+    for (const auto& kv : str_kvs) {
+      writeString16(buffer, kv.first);
+      writeString16(buffer, kv.second);
+    }
+  }
+  if (!int_kvs.empty()) {
+    buffer.writeByte(static_cast<uint8_t>(InfoId::IntKeyValue));
+    buffer.writeBEInt<uint16_t>(static_cast<uint16_t>(int_kvs.size()));
+    for (const auto& kv : int_kvs) {
+      buffer.writeBEInt<uint16_t>(kv.first);
+      writeString16(buffer, kv.second);
+    }
+  }
+  buffer.add("\0\0\0", padding);
   if (restore_framed_prefix) {
     buffer.writeBEInt<uint32_t>(static_cast<uint32_t>(msg_size));
   }
