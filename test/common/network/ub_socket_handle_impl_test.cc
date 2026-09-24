@@ -1016,6 +1016,7 @@ extern "C" void ubsocket_release_zc(void* owner) {
 
 extern "C" ssize_t ubsocket_read_zc(int, Envoy::Network::Ubsocket::Segment* segments,
                                     uint32_t count, size_t budget) {
+  std::fill_n(segments, count, Envoy::Network::Ubsocket::Segment{});
   auto& state = *Envoy::Network::fake_ubsocket_state;
   if (state.read_error != 0) {
     errno = state.read_error;

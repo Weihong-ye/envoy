@@ -368,7 +368,8 @@ Api::IoCallUint64Result UbSocketHandleImpl::read(Buffer::Instance& buffer,
   if (creation_error_ != 0) {
     return failClosedResult(creation_error_, "UB socket creation", fd_);
   }
-  std::array<Ubsocket::Segment, MaxUbsocketIov> segments{};
+  // With valid arguments, the segment ABI initializes every entry, including the unused tail.
+  std::array<Ubsocket::Segment, MaxUbsocketIov> segments;
   const ssize_t rc = api.readv_(fd_, segments.data(), segments.size(), budget);
   const int saved_errno = errno;
   if (rc <= 0) {
